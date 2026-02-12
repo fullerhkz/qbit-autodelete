@@ -1,0 +1,18 @@
+[Unit]
+Description=qBittorrent Auto-Delete (oneshot)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=SEU_USUARIO
+Group=SEU_USUARIO
+EnvironmentFile=/etc/qbit_autodelete.env
+ExecStart=/home/SEU_USUARIO/scripts/qbit-autodelete.sh
+WorkingDirectory=/home/SEU_USUARIO/scripts
+StandardOutput=append:/home/SEU_USUARIO/logs/qbit-autodelete.log
+StandardError=append:/home/SEU_USUARIO/logs/qbit-autodelete.log
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

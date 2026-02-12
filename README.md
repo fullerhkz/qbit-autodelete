@@ -1,5 +1,9 @@
 # qbit-autodelete
 
+![Shell Script](https://img.shields.io/badge/shell-bash-green)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Platform](https://img.shields.io/badge/platform-linux-lightgrey)
+
 Script Bash para **automação de exclusão de torrents** no qBittorrent, com regras de retenção por categoria, via API WebUI.
 
 ---
@@ -7,6 +11,7 @@ Script Bash para **automação de exclusão de torrents** no qBittorrent, com re
 ## Índice
 
 - [Visão Geral](#visão-geral)
+- [Como Funciona](#como-funciona)
 - [Funcionalidades](#funcionalidades)
 - [Requisitos e Dependências](#requisitos-e-dependências)
 - [Instalação Passo a Passo](#instalação-passo-a-passo)
@@ -21,7 +26,11 @@ Script Bash para **automação de exclusão de torrents** no qBittorrent, com re
   - [Criar o serviço (oneshot)](#criar-o-serviço-oneshot)
   - [Criar o timer (agendamento)](#criar-o-timer-agendamento)
   - [Ativar e validar](#ativar-e-validar)
+- [Exemplo de Saída](#exemplo-de-saída)
 - [Aliases Úteis](#aliases-úteis)
+- [Segurança](#segurança)
+- [Solução de Problemas](#solução-de-problemas)
+- [Desinstalação](#desinstalação)
 - [Boas Práticas e Dicas](#boas-práticas-e-dicas)
 - [Checklist Final](#checklist-final)
 - [Licença](#licença)
@@ -40,6 +49,34 @@ O `qbit-autodelete.sh` automatiza a remoção de torrents no qBittorrent com bas
 4. Para cada categoria configurada, calcula a idade dos torrents e identifica os elegíveis para exclusão.
 5. Remove torrents elegíveis conforme regras (respeitando `DRY_RUN`, limites e segurança).
 6. Escreve logs detalhados e um resumo de execução.
+
+---
+
+## Como Funciona
+
+```mermaid
+flowchart TD
+    A[Início] --> B[Carregar variáveis de ambiente]
+    B --> C{qBittorrent acessível?}
+    C -->|Não após 5 tentativas| D[Abortar sem erro]
+    C -->|Sim| E[Autenticar via API]
+    E --> F{Login OK?}
+    F -->|Não| G[Erro: falha no login]
+    F -->|Sim| H[Loop: para cada categoria]
+    H --> I[Buscar torrents da categoria]
+    I --> J[Enriquecer com idade e status]
+    J --> K[Filtrar candidatos por retenção]
+    K --> L{Candidatos encontrados?}
+    L -->|Não| M[Log: nenhum elegível + TOP 3]
+    L -->|Sim| N{DRY_RUN?}
+    N -->|Sim| O[Log: simulação apenas]
+    N -->|Não| P[Excluir torrents + arquivos]
+    M --> Q{Mais categorias?}
+    O --> Q
+    P --> Q
+    Q -->|Sim| H
+    Q -->|Não| R[Concluído]
+```
 
 ---
 
@@ -114,17 +151,18 @@ sudo chown SEU_USUARIO:SEU_USUARIO /home/SEU_USUARIO/scripts/qbit-autodelete.sh
 
 Este arquivo centraliza toda a configuração e credenciais, mantendo-os **fora do script**.
 
+> **📁 Template pronto:** [`templates/qbit_autodelete.env`](templates/qbit_autodelete.env)
+
+Copie o template e ajuste os valores:
+
 ```bash
+sudo cp templates/qbit_autodelete.env /etc/qbit_autodelete.env
 sudo nano /etc/qbit_autodelete.env
 ```
 
-Cole o conteúdo abaixo, ajustando os valores conforme sua instalação:
+Ou crie manualmente com o conteúdo abaixo:
 
 ```bash
-# ================================================
-# Configuração do qbit-autodelete
-# ================================================
-
 # URL da WebUI/API do qBittorrent (usar localhost)
 QBT_URL="http://127.0.0.1:PORTA_QBITTORRENT"
 
@@ -133,8 +171,8 @@ QBT_USER="SEU_USUARIO"
 QBT_PASS="SUA_SENHA_AQUI"
 
 # Modo de operação
-DRY_RUN="false"                 # true = simula sem apagar | false = executa exclusões
-LOG_LEVEL="summary"             # summary = resumo | detailed = lista todos os candidatos
+DRY_RUN="false"                  # true = simula sem apagar | false = executa exclusões
+LOG_LEVEL="summary"              # summary = resumo | detailed = lista todos os candidatos
 ALLOW_INCOMPLETE_DELETE="false"  # true = deleta incompletos também | false = só completos
 MAX_DELETE_PER_RUN="9999"        # limite máximo de exclusões por execução
 
@@ -159,7 +197,7 @@ sudo chmod 640 /etc/qbit_autodelete.env
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
-| `QBT_URL` | `http://127.0.0.1:PORTA_QBITTORRENT` | URL da API do qBittorrent. Use localhost. |
+| `QBT_URL` | `http://127.0.0.1:PORTA` | URL da API do qBittorrent. Use localhost. |
 | `QBT_USER` | *(obrigatório)* | Usuário da WebUI do qBittorrent |
 | `QBT_PASS` | *(obrigatório)* | Senha da WebUI do qBittorrent |
 | `DRY_RUN` | `true` | `true` = simula sem excluir; `false` = exclui de fato |
@@ -234,13 +272,20 @@ Se aparecer `Login OK.` e a listagem por categorias, o script está funcionando 
 
 ### Criar o serviço (oneshot)
 
-Crie o arquivo de unidade do serviço:
+> **📁 Template pronto:** [`templates/qbit-autodelete.service`](templates/qbit-autodelete.service)
+
+Copie o template e ajuste:
+
+```bash
+sudo cp templates/qbit-autodelete.service /etc/systemd/system/qbit-autodelete.service
+sudo nano /etc/systemd/system/qbit-autodelete.service
+```
+
+Ou crie manualmente. Substitua `SEU_USUARIO` pelo seu nome de usuário:
 
 ```bash
 sudo nano /etc/systemd/system/qbit-autodelete.service
 ```
-
-Cole o seguinte conteúdo (substitua `SEU_USUARIO` pelo seu nome de usuário):
 
 ```ini
 [Unit]
@@ -273,13 +318,19 @@ WantedBy=multi-user.target
 
 ### Criar o timer (agendamento)
 
-Crie o arquivo do timer:
+> **📁 Template pronto:** [`templates/qbit-autodelete.timer`](templates/qbit-autodelete.timer)
+
+Copie o template:
+
+```bash
+sudo cp templates/qbit-autodelete.timer /etc/systemd/system/qbit-autodelete.timer
+```
+
+Ou crie manualmente (execução a cada hora):
 
 ```bash
 sudo nano /etc/systemd/system/qbit-autodelete.timer
 ```
-
-Cole o seguinte conteúdo (execução a cada hora):
 
 ```ini
 [Unit]
@@ -330,6 +381,41 @@ tail -n 80 /home/SEU_USUARIO/logs/qbit-autodelete.log
 
 ---
 
+## Exemplo de Saída
+
+Uma execução típica produz a seguinte saída nos logs:
+
+```
+[CRON] Executado em Wed Feb 12 13:00:01 UTC 2026
+[INFO] Iniciando sessão...
+[INFO] Login OK.
+
+========== Categoria: 'Categoria-1' (retenção: 168h) ==========
+[INFO] Resumo categoria 'Categoria-1': {"total":8,"completos":8,"elegiveis_por_idade":3}
+[INFO] Encontrados 3 candidatos em categoria 'Categoria-1':
+[INFO] Excluindo 3 torrents em categoria 'Categoria-1'...
+[OK] Exclusão concluída (categoria 'Categoria-1').
+
+========== Categoria: 'Categoria-2' (retenção: 168h) ==========
+[INFO] Resumo categoria 'Categoria-2': {"total":5,"completos":5,"elegiveis_por_idade":0}
+[INFO] Nenhum torrent atingiu o prazo em categoria 'Categoria-2'.
+[INFO] TOP 3 mais antigos em categoria 'Categoria-2':
+Ubuntu.24.04.Desktop.ISO	142h
+Debian.12.Server.ISO	98h
+Fedora.41.Workstation.ISO	67h
+
+[INFO] Concluído.
+```
+
+Quando em modo `DRY_RUN="true"`:
+
+```
+[INFO] Encontrados 3 candidatos em categoria 'Categoria-1':
+[DRY-RUN] Exclusão NÃO executada.
+```
+
+---
+
 ## Aliases Úteis
 
 Adicione atalhos ao seu terminal para facilitar o dia-a-dia. Substitua `SEU_USUARIO` pelo seu nome de usuário:
@@ -350,6 +436,100 @@ Recarregue:
 
 ```bash
 source ~/.bash_aliases
+```
+
+---
+
+## Segurança
+
+O script implementa múltiplas camadas de segurança:
+
+| Camada | Mecanismo | Detalhes |
+|--------|-----------|----------|
+| **Credenciais** | Arquivo `.env` externo | Credenciais ficam fora do script, em `/etc/qbit_autodelete.env` com permissão `640` |
+| **Rede** | Conexão local | Usa `127.0.0.1` — sem exposição à rede externa, sem dependência de DNS ou reverse proxy |
+| **Cookie** | Temporário com cleanup | Arquivo temporário via `mktemp`, removido automaticamente via `trap EXIT INT TERM` |
+| **DRY_RUN** | Ativo por padrão | O script não exclui nada até você explicitamente definir `DRY_RUN="false"` |
+| **Incompletos** | Protegidos por padrão | `ALLOW_INCOMPLETE_DELETE="false"` impede exclusão de downloads em andamento |
+| **Limite** | `MAX_DELETE_PER_RUN` | Evita exclusões em massa acidentais por execução |
+| **Variáveis obrigatórias** | `${VAR:?}` | Script aborta imediatamente se `QBT_USER` ou `QBT_PASS` não estiverem definidas |
+| **Falha graceful** | Exit 0 em timeout | Se o qBittorrent não responder, o script encerra sem marcar falha no systemd |
+
+### Recomendações adicionais
+
+- Mantenha o `.env` com `root:SEU_USUARIO` e `chmod 640`
+- Nunca coloque credenciais diretamente no script
+- Use `DRY_RUN="true"` até validar as regras de retenção
+- Revise os logs regularmente: `tail -f /home/SEU_USUARIO/logs/qbit-autodelete.log`
+
+---
+
+## Solução de Problemas
+
+### `[ERRO] Falha no login`
+
+| Causa | Solução |
+|-------|---------|
+| Credenciais incorretas | Verifique `QBT_USER` e `QBT_PASS` no `.env` |
+| WebUI com autenticação desabilitada | Habilite autenticação na WebUI do qBittorrent |
+| Proteção anti-brute-force ativa | Aguarde ou reinicie o qBittorrent |
+
+### `qBittorrent ainda não respondeu após 5 tentativas`
+
+| Causa | Solução |
+|-------|---------|
+| Porta incorreta | Verifique `QBT_URL` — confira a porta na configuração da WebUI |
+| qBittorrent parado | `sudo systemctl start qbittorrent` ou equivalente |
+| Firewall bloqueando | Verifique se a porta está acessível localmente: `curl -s http://127.0.0.1:PORTA/api/v2/app/version` |
+
+### `comando 'jq' não encontrado`
+
+```bash
+sudo apt install -y jq
+```
+
+### Script roda mas não deleta nada
+
+| Possível causa | Verificação |
+|----------------|-------------|
+| Modo simulação ativo | Confirme que `DRY_RUN="false"` no `.env` |
+| Limite zerado | Confirme que `MAX_DELETE_PER_RUN` > 0 (recomendado: `9999`) |
+| Torrents incompletos | Se os torrents não estão 100%, defina `ALLOW_INCOMPLETE_DELETE="true"` |
+| Retenção muito alta | Verifique os valores em `RETENTION_HOURS` no script |
+
+### Logs não aparecem
+
+| Causa | Solução |
+|-------|---------|
+| Diretório de logs não existe | `mkdir -p /home/SEU_USUARIO/logs` |
+| Permissão negada | `sudo chown SEU_USUARIO:SEU_USUARIO /home/SEU_USUARIO/logs` |
+| Serviço não rodou | `sudo systemctl start qbit-autodelete.service` e cheque o status |
+
+---
+
+## Desinstalação
+
+Para remover completamente o qbit-autodelete:
+
+```bash
+# 1. Parar e desabilitar o timer e serviço
+sudo systemctl disable --now qbit-autodelete.timer
+sudo systemctl stop qbit-autodelete.service
+
+# 2. Remover units do systemd
+sudo rm /etc/systemd/system/qbit-autodelete.service
+sudo rm /etc/systemd/system/qbit-autodelete.timer
+sudo systemctl daemon-reload
+
+# 3. Remover script e logs
+rm /home/SEU_USUARIO/scripts/qbit-autodelete.sh
+rm -rf /home/SEU_USUARIO/logs/qbit-autodelete.log
+
+# 4. Remover arquivo de configuração
+sudo rm /etc/qbit_autodelete.env
+
+# 5. (Opcional) Remover aliases
+# Edite ~/.bash_aliases e remova as linhas qbit-del-*
 ```
 
 ---
