@@ -62,7 +62,7 @@ O `qbit-autodelete.sh` automatiza a remoção de torrents no qBittorrent com bas
 
 ### Sistema operacional
 
-- **Ubuntu** (ou qualquer distribuição Linux com systemd)
+- **Debian/Ubuntu** (ou qualquer distribuição Linux com systemd)
 
 ### Pacotes necessários
 
