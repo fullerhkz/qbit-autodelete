@@ -1,0 +1,10 @@
+[Unit]
+Description=Executa o Auto-Delete do qBittorrent a cada hora
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=qbit-autodelete.service
+
+[Install]
+WantedBy=timers.target
