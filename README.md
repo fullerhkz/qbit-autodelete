@@ -4,7 +4,7 @@ Limpeza segura de torrents do qBittorrent orientada a **maximizar upload por GiB
 armazenado**, com historico persistente, retencao e ratio por categoria e modo
 agressivo opcional quando o filesystem fica com pouco espaco.
 
-## O que significa o gatilho de "150 GB"
+## O que significa o gatilho de "XYZ GB"
 
 Esse valor normalmente e um *low watermark*: quando o espaco livre cai abaixo dele,
 o limpador aceita candidatos de pontuacao mais baixa ate tentar chegar a um *high
