@@ -1,0 +1,37 @@
+[Unit]
+Description=Limpeza inteligente de torrents do qBittorrent
+Documentation=https://github.com/fullerhkz/qbit-autodelete
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=QBIT_SERVICE_USER
+Group=QBIT_SERVICE_GROUP
+ExecStart=/PATH/TO/qbit-autodelete --config /PATH/TO/qbit-autodelete.env
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+StateDirectory=qbit-autodelete
+StateDirectoryMode=0700
+
+# O journal faz rotacao e evita um arquivo de log sem limite.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbit-autodelete

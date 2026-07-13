@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export TEST_ROOT QBIT_AUTODELETE_LIBRARY=true
+# shellcheck source=../qbit-autodelete.sh
+source "${TEST_ROOT}/qbit-autodelete.sh"
+
+fail() { printf 'FALHOU: %s\n' "$*" >&2; exit 1; }
+assert_eq() { [[ "$1" == "$2" ]] || fail "esperado '$2', recebido '$1' ($3)"; }
+
+parse_args --config "${TEST_ROOT}/tests/fixtures/test.env"
+load_config
+validate_config
+
+now=2000000000
+rules='{"Categoria Filmes":{"retention_hours":48,"min_ratio":1.0}}'
+input="$(jq -cn --argjson now "${now}" '[
+  {
+    hash:"large", name:"grande sem upload", category:"Categoria Filmes",
+    progress:1, amount_left:0, completion_on:($now - 10*86400),
+    last_activity:($now - 8*86400), size:(100*1073741824), total_size:(100*1073741824),
+    uploaded:0, ratio:2, num_complete:20, num_seeds:2, num_incomplete:0,
+    upspeed:0, dlspeed:0, state:"stalledUP", force_start:false, tags:""
+  },
+  {
+    hash:"productive", name:"alto upload por GiB", category:"Categoria Filmes",
+    progress:1, amount_left:0, completion_on:($now - 10*86400),
+    last_activity:($now - 8*86400), size:(100*1073741824), total_size:(100*1073741824),
+    uploaded:(10*1073741824), ratio:2, num_complete:0, num_seeds:0, num_incomplete:20,
+    upspeed:0, dlspeed:0, state:"stalledUP", force_start:false, tags:""
+  },
+  {
+    hash:"active", name:"ativo", category:"Categoria Filmes",
+    progress:1, amount_left:0, completion_on:($now - 10*86400),
+    last_activity:($now - 8*86400), size:(100*1073741824), uploaded:0, ratio:2,
+    num_complete:20, upspeed:1024, dlspeed:0, state:"uploading", force_start:false, tags:""
+  },
+  {
+    hash:"protected", name:"protegido", category:"Categoria Filmes",
+    progress:1, amount_left:0, completion_on:($now - 10*86400),
+    last_activity:($now - 8*86400), size:(100*1073741824), uploaded:0, ratio:2,
+    num_complete:20, upspeed:0, dlspeed:0, state:"stalledUP", force_start:false, tags:"keep"
+  },
+  {
+    hash:"under_ratio", name:"ratio ainda protegido", category:"Categoria Filmes",
+    progress:1, amount_left:0, completion_on:($now - 100*3600),
+    last_activity:($now - 100*3600), size:(100*1073741824), uploaded:0, ratio:0.2,
+    num_complete:20, upspeed:0, dlspeed:0, state:"stalledUP", force_start:false, tags:""
+  },
+  {
+    hash:"young", name:"novo", category:"Categoria Filmes",
+    progress:1, amount_left:0, completion_on:($now - 24*3600),
+    last_activity:($now - 24*3600), size:(100*1073741824), uploaded:0, ratio:2,
+    num_complete:20, upspeed:0, dlspeed:0, state:"stalledUP", force_start:false, tags:""
+  },
+  {
+    hash:"partial", name:"incompleto visto no swarm", category:"Categoria Filmes",
+    progress:0.5, amount_left:100, completion_on:0, seen_complete:($now - 30*86400),
+    added_on:($now - 30*86400), last_activity:($now - 8*86400), size:(100*1073741824),
+    uploaded:0, ratio:2, num_complete:20, upspeed:0, dlspeed:0,
+    state:"stalledDL", force_start:false, tags:""
+  }
+]')"
+
+history="$(jq -cn --argjson now "${now}" '{
+  version:1, updated_at:($now - 3600), torrents:{
+    large:{uploaded:0, sampled_at:($now - 3600), ewma_upload_bph:0, samples:5, observed_seconds:18000},
+    productive:{uploaded:0, sampled_at:($now - 3600), ewma_upload_bph:0, samples:5, observed_seconds:18000}
+  }
+}')"
+
+scored="$(score_torrents "${now}" "${rules}" "${history}" <<<"${input}")"
+assert_eq "$(jq -r '.[] | select(.hash=="large") | .cleanup_score' <<<"${scored}")" "100" "torrent improdutivo recebe score maximo"
+assert_eq "$(jq -r '.[] | select(.hash=="large") | .history_ready' <<<"${scored}")" "true" "historico suficiente"
+assert_eq "$(jq -r '.[] | select(.hash=="large") | .eligible' <<<"${scored}")" "true" "candidato valido"
+assert_eq "$(jq -r '.[] | select(.hash=="productive") | .cleanup_score' <<<"${scored}")" "40" "upload eficiente reduz score"
+assert_eq "$(jq -r '.[] | select(.hash=="active") | .eligible' <<<"${scored}")" "false" "transferencia ativa"
+assert_eq "$(jq -r '.[] | select(.hash=="protected") | .eligible' <<<"${scored}")" "false" "tag protegida"
+assert_eq "$(jq -r '.[] | select(.hash=="under_ratio") | .ratio_protected' <<<"${scored}")" "true" "ratio minimo"
+assert_eq "$(jq -r '.[] | select(.hash=="young") | .eligible' <<<"${scored}")" "false" "retencao minima"
+assert_eq "$(jq -r '.[] | select(.hash=="partial") | .is_complete' <<<"${scored}")" "false" "seen_complete nao e conclusao local"
+assert_eq "$(jq -r '.[] | select(.hash=="partial") | .eligible' <<<"${scored}")" "false" "incompleto protegido"
+
+RUN_MODE="normal"
+selected="$(select_candidates "${scored}")"
+assert_eq "$(jq -r 'length' <<<"${selected}")" "1" "selecao normal"
+assert_eq "$(jq -r '.[0].hash' <<<"${selected}")" "large" "preserva maior retorno por GiB"
+
+# Com 100% como piso, qualquer filesystem real entra em pressao.
+DISK_PRESSURE_ENABLED="true"
+STORAGE_PATH="/tmp"
+LOW_WATERMARK_GB=0
+HIGH_WATERMARK_GB=0
+LOW_WATERMARK_PERCENT=100
+HIGH_WATERMARK_PERCENT=100
+choose_mode
+assert_eq "${RUN_MODE}" "aggressive" "gatilho de pressao por percentual"
+((BYTES_NEEDED > 0)) || fail "modo agressivo deve calcular bytes a recuperar"
+
+printf 'OK: retorno de upload, historico, ratio e protecoes validados\n'
