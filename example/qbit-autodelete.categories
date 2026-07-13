@@ -1,0 +1,8 @@
+# Uma regra por linha: categoria|retencao minima em horas|minimo de ratio
+# O terceiro campo e opcional e usa DEFAULT_MIN_RATIO quando omitido.
+# Linhas comentadas sao ignoradas.
+
+Categoria-Filmes|48|1.0
+Categoria-Series|72|1.0
+Categoria-Cursos|120|1.0
+Tracker-Privado|168|2.0
