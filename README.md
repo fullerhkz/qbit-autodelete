@@ -117,9 +117,60 @@ GiB por execucao.
 > O espaco recuperado e uma estimativa. Hardlinks, snapshots, arquivos compartilhados
 > e a exclusao assincrona pelo qBittorrent podem fazer o valor real ser diferente.
 
-## Arquivos de configuracao
+## Instalador interativo (recomendado)
 
-Nao e necessario editar o script. Copie os dois modelos:
+O instalador apresenta um menu colorido e nao exige editar o script ou as units.
+Execute-o a partir da raiz do repositorio:
+
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+Ele solicita `sudo` somente quando precisa alterar o sistema e pergunta:
+
+- usuario Linux que executara o servico;
+- URL, usuario e senha da Web UI do qBittorrent;
+- ponto de montagem que armazena os torrents;
+- gatilho e alvo de espaco livre em percentual;
+- categorias, retencao minima e ratio minimo em uma tabela editavel.
+
+Na pergunta da URL, pressionar Enter usa `http://127.0.0.1:8080`. A senha nao aparece
+na tela nem no resumo. Uma instalacao nova sempre usa `DRY_RUN=true`, valida a
+configuracao como o usuario escolhido, ativa o timer e executa uma primeira simulacao.
+
+O menu tambem permite reconfigurar, atualizar preservando `.env` e categorias, ver o
+status e desinstalar. Antes de substituir arquivos existentes, cria um backup em
+`/var/backups/qbit-autodelete`. A desinstalacao preserva configuracao e historico por
+padrao e nunca remove os torrents.
+
+Os destinos padrao sao genericos:
+
+| Arquivo | Destino |
+|---|---|
+| programa | `/usr/local/bin/qbit-autodelete` |
+| configuracao | `/etc/qbit-autodelete.env` |
+| categorias | `/etc/qbit-autodelete.categories` |
+| estado | `/var/lib/qbit-autodelete/` |
+| units | `/etc/systemd/system/` |
+
+O instalador requer Linux com systemd. Se faltarem dependencias, oferece instalacao
+automatica em Arch Linux/CachyOS (`pacman`), Debian/Ubuntu (`apt`), Fedora/RHEL (`dnf`)
+e openSUSE (`zypper`). Nenhuma senha ou dado informado e enviado para o repositorio.
+
+As mesmas acoes podem ser abertas diretamente:
+
+```bash
+./install.sh install
+./install.sh reconfigure
+./install.sh update
+./install.sh status
+./install.sh uninstall
+```
+
+### Instalacao manual
+
+Se preferir nao usar o instalador, nao e necessario editar o script. Copie os dois modelos:
 
 ```bash
 sudo install -m 0755 qbit-autodelete.sh /PATH/TO/qbit-autodelete
@@ -168,7 +219,8 @@ for deliberada.
 O par `Type=oneshot` + timer e apropriado: nao mantem outro daemon residente, registra
 inicio/fim/erro e o systemd nao inicia uma segunda instancia da mesma unit enquanto ela
 ja estiver ativa. `StateDirectory=qbit-autodelete` cria um diretorio de estado persistente
-com permissao para o usuario do servico. Instale os modelos depois de substituir todos os placeholders:
+com permissao para o usuario do servico. O instalador faz esta etapa automaticamente.
+Na instalacao manual, instale os modelos depois de substituir todos os placeholders:
 
 ```bash
 sudo install -m 0644 example/qbit-autodelete.service /etc/systemd/system/
