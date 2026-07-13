@@ -21,6 +21,44 @@ modo agressivo tenta chegar      ao alvo
 Quando GB e percentual estao configurados, vale o maior limite. Em um volume grande,
 uma configuracao somente percentual como `10% -> 15%` costuma ser mais coerente.
 
+## Perfil recomendado: RAID0 unico e racing pelo autobrr
+
+Quando varios HDDs formam um unico filesystem RAID0, configure `STORAGE_PATH` com o
+ponto de montagem agregado. O script mede o volume como uma unidade; nao e necessario
+informar cada disco. O perfil padrao foi ajustado para servidores de varios terabytes
+que recebem torrents automaticamente e precisam manter margem para novas races:
+
+```bash
+DISK_PRESSURE_ENABLED="true"
+STORAGE_PATH="/PATH/TO/RAID/MOUNT"
+LOW_WATERMARK_GB="0"
+HIGH_WATERMARK_GB="0"
+LOW_WATERMARK_PERCENT="10"
+HIGH_WATERMARK_PERCENT="15"
+
+NORMAL_MIN_SCORE="70"
+AGGRESSIVE_MIN_SCORE="35"
+AGGRESSIVE_WITHOUT_HISTORY="false"
+MAX_DELETE_PER_RUN="15"
+MAX_RECLAIM_GB_PER_RUN="400"
+```
+
+Em um volume nominal proximo de 6 TB, os percentuais reservam aproximadamente 10% para
+acionar a limpeza agressiva e buscam retornar a 15%; os bytes exatos dependem da
+capacidade que o filesystem reporta. Essa folga absorve entradas simultaneas do autobrr.
+
+`AGGRESSIVE_WITHOUT_HISTORY=false` impede que um torrent recem-adicionado seja julgado
+sem medicao de upload. As seis amostras iniciais formam a linha de base; depois, uma
+race com alto upload por GiB permanece com score baixo, enquanto resultados parados
+sobem gradualmente na fila de exclusao. Categorias vindas do autobrr devem ter retencao
+e ratio coerentes com cada tracker; as tags `keep` e `never-delete` continuam sendo uma
+protecao absoluta.
+
+O timer horario e suficiente porque o contador acumulado captura todo o upload entre
+execucoes, inclusive picos curtos. O limite de 15 itens e 400 GiB por rodada reduz
+rajadas de exclusoes nos HDDs. RAID0 nao oferece redundancia: a falha de um disco pode
+comprometer todo o volume, independentemente deste script.
+
 ## Politica
 
 Um torrent so pode ser candidato depois de passar pelas protecoes:
