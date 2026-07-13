@@ -13,6 +13,12 @@ parse_args --config "${TEST_ROOT}/tests/fixtures/test.env"
 load_config
 validate_config
 
+assert_eq "${NORMAL_MIN_SCORE}" "70" "perfil racing: score normal"
+assert_eq "${AGGRESSIVE_MIN_SCORE}" "35" "perfil racing: score agressivo"
+assert_eq "${AGGRESSIVE_WITHOUT_HISTORY}" "false" "perfil racing: exige historico"
+assert_eq "${MAX_DELETE_PER_RUN}" "15" "perfil racing: limite de itens"
+assert_eq "${MAX_RECLAIM_GB_PER_RUN}" "400" "perfil racing: limite estimado por rodada"
+
 now=2000000000
 rules='{"Categoria Filmes":{"retention_hours":48,"min_ratio":1.0}}'
 input="$(jq -cn --argjson now "${now}" '[
