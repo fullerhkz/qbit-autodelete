@@ -130,14 +130,15 @@ chmod +x install.sh
 Ele solicita `sudo` somente quando precisa alterar o sistema e pergunta:
 
 - usuario Linux que executara o servico;
-- URL, usuario e senha da Web UI do qBittorrent;
+- endereco, porta, usuario e senha da Web UI do qBittorrent;
 - ponto de montagem que armazena os torrents;
 - gatilho e alvo de espaco livre em percentual;
 - categorias, retencao minima e ratio minimo em uma tabela editavel.
 
-Na pergunta da URL, pressionar Enter usa `http://127.0.0.1:8080`. A senha nao aparece
-na tela nem no resumo. Uma instalacao nova sempre usa `DRY_RUN=true`, valida a
-configuracao como o usuario escolhido, ativa o timer e executa uma primeira simulacao.
+Na pergunta do endereco, pressionar Enter usa `http://127.0.0.1`; a porta e solicitada
+separadamente e oferece `8080` como padrao. A senha nao aparece na tela nem no resumo.
+Uma instalacao nova sempre usa `DRY_RUN=true`, valida a configuracao como o usuario
+escolhido, ativa o timer e executa uma primeira simulacao.
 
 O menu tambem permite reconfigurar, atualizar preservando `.env` e categorias, ver o
 status e desinstalar. Antes de substituir arquivos existentes, cria um backup em
