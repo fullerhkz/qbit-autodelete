@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SERVICE_NAME="${QBIT_DEL_SERVICE:-qbit-autodelete.service}"
 TIMER_NAME="${QBIT_DEL_TIMER:-qbit-autodelete.timer}"
 SYSTEMCTL="${QBIT_DEL_SYSTEMCTL:-systemctl}"
@@ -99,6 +99,110 @@ human_bytes() {
     else if (bytes >= 1024) printf "%.2f KiB", bytes / 1024;
     else printf "%d B", bytes;
   }'
+}
+
+human_rate() {
+  printf '%s/s' "$(human_bytes "${1:-0}")"
+}
+
+show_policy_snapshot() {
+  local policy="$1" managed total unmanaged size active upload ready eligible selected
+  local score_average score_minimum score_maximum policy_mode category_count omitted
+  if [[ "$(jq 'length' <<<"${policy}")" -eq 0 ]]; then
+    printf '\n%s%sPONTUACAO NA ULTIMA AVALIACAO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+    line
+    printf '  %sResumo indisponivel; execute novamente com a versao atual.%s\n' "${YELLOW}" "${RESET}"
+    return 0
+  fi
+
+  managed="$(jq -r '.managed_torrents // 0' <<<"${policy}")"
+  total="$(jq -r '.total_torrents // 0' <<<"${policy}")"
+  unmanaged="$(jq -r '.unmanaged_torrents // 0' <<<"${policy}")"
+  size="$(jq -r '.managed_size_bytes // 0' <<<"${policy}")"
+  active="$(jq -r '.active_torrents // 0' <<<"${policy}")"
+  upload="$(jq -r '.upload_speed_bps // 0' <<<"${policy}")"
+  ready="$(jq -r '.history_ready // 0' <<<"${policy}")"
+  eligible="$(jq -r '.eligible_torrents // 0' <<<"${policy}")"
+  selected="$(jq -r '.selected_torrents // 0' <<<"${policy}")"
+  score_average="$(jq -r '.scores.average // 0' <<<"${policy}")"
+  score_minimum="$(jq -r '.scores.minimum // 0' <<<"${policy}")"
+  score_maximum="$(jq -r '.scores.maximum // 0' <<<"${policy}")"
+  policy_mode="$(jq -r '.mode // "desconhecido"' <<<"${policy}")"
+
+  printf '\n%s%sPONTUACAO NA ULTIMA AVALIACAO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  printf '  %-25s %s/%s (%s fora da politica)\n' "Torrents gerenciados:" "${managed}" "${total}" "${unmanaged}"
+  printf '  %-25s %s\n' "Volume gerenciado:" "$(human_bytes "${size}")"
+  printf '  %-25s %s | upload atual %s\n' "Transferencias ativas:" "${active}" "$(human_rate "${upload}")"
+  printf '  %-25s %s/%s\n' "Historico pronto:" "${ready}" "${managed}"
+  printf '  %-25s %s | selecionados %s\n' "Elegiveis:" "${eligible}" "${selected}"
+  printf '  %-25s media %s | min %s | max %s\n' "Scores:" "${score_average}" "${score_minimum}" "${score_maximum}"
+  printf '  %-25s %s\n' "Modo da politica:" "${policy_mode}"
+
+  printf '\n%s%sCATEGORIAS POR ESPACO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  category_count="$(jq '.categories | length' <<<"${policy}")"
+  if ((category_count == 0)); then
+    printf '  Nenhuma categoria gerenciada.\n'
+  else
+    local category category_name category_items category_size category_upload category_active
+    local category_ready category_eligible category_selected average_score maximum_score
+    while IFS= read -r category; do
+      category_name="$(jq -r '.category // "" | if length == 0 then "(sem categoria)" else . end | gsub("[\\r\\n\\t]"; " ")' <<<"${category}")"
+      category_items="$(jq -r '.count // 0' <<<"${category}")"
+      category_size="$(jq -r '.size_bytes // 0' <<<"${category}")"
+      category_upload="$(jq -r '.upload_speed_bps // 0' <<<"${category}")"
+      category_active="$(jq -r '.active // 0' <<<"${category}")"
+      category_ready="$(jq -r '.history_ready // 0' <<<"${category}")"
+      category_eligible="$(jq -r '.eligible // 0' <<<"${category}")"
+      category_selected="$(jq -r '.selected // 0' <<<"${category}")"
+      average_score="$(jq -r '.average_score // 0' <<<"${category}")"
+      maximum_score="$(jq -r '.maximum_score // 0' <<<"${category}")"
+      printf '\n  %s%s%s  %s torrent(s) | %s | %s\n' "${BOLD}" "${category_name}" "${RESET}" \
+        "${category_items}" "$(human_bytes "${category_size}")" "$(human_rate "${category_upload}")"
+      printf '    score med/max %s/%s | historico %s/%s | ativos %s | elegiveis %s | selecionados %s\n' \
+        "${average_score}" "${maximum_score}" "${category_ready}" "${category_items}" \
+        "${category_active}" "${category_eligible}" "${category_selected}"
+    done < <(jq -c '.categories[:8][]' <<<"${policy}")
+    omitted=$((category_count - 8))
+    ((omitted <= 0)) || printf '\n  %s... %s categoria(s) menor(es) omitida(s).%s\n' "${DIM}" "${omitted}" "${RESET}"
+  fi
+
+  printf '\n%s%sMAIORES SCORES ATUAIS%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  if [[ "$(jq '.top_scores | length' <<<"${policy}")" -eq 0 ]]; then
+    printf '  Nenhum torrent gerenciado.\n'
+  else
+    local item position=0 name category_name item_size score efficiency speed inactive ratio seeds leechers
+    local item_status item_status_color
+    while IFS= read -r item; do
+      ((position += 1))
+      name="$(jq -r '.name // "(sem nome)" | gsub("[\\r\\n\\t]"; " ")' <<<"${item}")"
+      category_name="$(jq -r '.category // "" | if length == 0 then "(sem categoria)" else . end | gsub("[\\r\\n\\t]"; " ")' <<<"${item}")"
+      item_size="$(jq -r '.size_bytes // 0' <<<"${item}")"
+      score="$(jq -r '.score // 0' <<<"${item}")"
+      efficiency="$(jq -r '.upload_efficiency // 0' <<<"${item}")"
+      speed="$(jq -r '.upload_speed_bps // 0' <<<"${item}")"
+      inactive="$(jq -r '.inactive_hours // 0' <<<"${item}")"
+      ratio="$(jq -r '.ratio // 0' <<<"${item}")"
+      seeds="$(jq -r '.seeds // 0' <<<"${item}")"
+      leechers="$(jq -r '.leechers // 0' <<<"${item}")"
+      if [[ "$(jq -r '.selected // false' <<<"${item}")" == "true" ]]; then
+        item_status="SELECIONADO" item_status_color="${RED}"
+      elif [[ "$(jq -r '.history_ready // false' <<<"${item}")" != "true" ]]; then
+        item_status="APRENDENDO" item_status_color="${YELLOW}"
+      elif [[ "$(jq -r '.eligible // false' <<<"${item}")" == "true" ]]; then
+        item_status="ELEGIVEL" item_status_color="${CYAN}"
+      else
+        item_status="NAO ELEGIVEL" item_status_color="${DIM}"
+      fi
+      printf '\n  #%s  score %-6s %s[%s]%s %s\n' "${position}" "${score}" \
+        "${item_status_color}" "${item_status}" "${RESET}" "${name}"
+      printf '      %s | %s | eficiencia %s MiB/GiB/dia | upload %s\n' \
+        "${category_name}" "$(human_bytes "${item_size}")" "${efficiency}" "$(human_rate "${speed}")"
+      printf '      inativo %sh | ratio %s | swarm %sS/%sL\n' "${inactive}" "${ratio}" "${seeds}" "${leechers}"
+    done < <(jq -c '.top_scores[]' <<<"${policy}")
+  fi
 }
 
 cmd_run() {
@@ -233,7 +337,7 @@ cmd_log() {
   if [[ -z "${QBIT_DEL_JOURNAL_FILE:-}" ]]; then
     command -v "${JOURNALCTL}" >/dev/null 2>&1 || die "comando ausente: ${JOURNALCTL}"
   fi
-  local journal event_lines events last_run run start configured connection completed failure summary deleted
+  local journal event_lines events last_run run start configured connection completed failure summary deleted policy
   local start_time end_time run_mode result_text connection_text count planned_count released planned
   journal="$(read_journal 2>/dev/null || true)"
   event_lines="$(extract_events <<<"${journal}")"
@@ -254,6 +358,7 @@ cmd_log() {
   failure="$(jq -c '[.[] | select(.event == "run_failed")] | last // {}' <<<"${run}")"
   summary="$(jq -c '[.[] | select(.event == "deletion_summary")] | last // {}' <<<"${run}")"
   deleted="$(jq -c '[.[] | select(.event == "torrent_deleted")]' <<<"${run}")"
+  policy="$(jq -c '[.[] | select(.event == "policy_snapshot")] | last // {}' <<<"${run}")"
 
   start_time="$(jq -r '.timestamp // ""' <<<"${start}")"
   end_time="$(jq -r '.timestamp // ""' <<<"${completed}")"
@@ -295,6 +400,8 @@ cmd_log() {
   if [[ "$(jq 'length' <<<"${failure}")" -gt 0 ]]; then
     printf '  %-24s %s\n' "Erro:" "$(jq -r '.message // "erro nao informado" | gsub("[\\r\\n\\t]"; " ")' <<<"${failure}")"
   fi
+
+  show_policy_snapshot "${policy}"
 
   printf '\n%s%sEXCLUSOES%s\n' "${BOLD}" "${CYAN}" "${RESET}"
   line

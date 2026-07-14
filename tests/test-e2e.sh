@@ -32,6 +32,8 @@ grep -q 'eficiencia=0MiB/GiB/dia' <<<"${second_output}"
 grep -q '\[DRY-RUN\] nenhuma exclusao executada' <<<"${second_output}"
 grep -q 'QBIT_EVENT.*"event":"connection".*"success":true' <<<"${second_output}"
 grep -q 'QBIT_EVENT.*"event":"run_configured".*"dry_run":true' <<<"${second_output}"
+grep -q 'QBIT_EVENT.*"event":"policy_snapshot".*"managed_torrents":1.*"top_scores"' <<<"${second_output}"
+grep -q '"scores":{"average":90,"minimum":90,"maximum":90}' <<<"${second_output}"
 grep -q 'QBIT_EVENT.*"event":"deletion_summary".*"dry_run":true' <<<"${second_output}"
 [[ ! -e "${delete_file}" ]]
 

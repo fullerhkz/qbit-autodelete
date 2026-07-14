@@ -193,9 +193,18 @@ inativo depois de concluir; o painel diferencia esse estado de uma falha.
 
 - data, hora, modo real ou `DRY_RUN` e resultado;
 - confirmacao da conexao com o qBittorrent;
+- quantidade, volume, atividade e upload dos torrents gerenciados;
+- historico pronto, elegiveis, selecionados e faixa de pontuacao;
+- ate oito categorias ordenadas por espaco, com score medio e maximo;
+- os cinco maiores scores, com eficiencia, inatividade, ratio e swarm;
 - torrents realmente removidos, agrupados por categoria;
 - horario, tamanho estimado e nome de cada torrent;
 - total removido e espaco estimado liberado.
+
+Essas metricas representam o estado observado na ultima execucao, nao uma consulta em
+tempo real. Score alto significa maior prioridade de limpeza, mas o status exibido ao
+lado do torrent deixa claro se ele foi selecionado, ainda esta aprendendo, esta apenas
+elegivel ou permanece bloqueado pelas protecoes.
 
 O relatorio nao registra nem exibe credenciais. O espaco e estimado porque hardlinks,
 snapshots e arquivos compartilhados podem mudar o ganho real no filesystem. Logs

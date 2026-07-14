@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.1.0"
+VERSION="3.2.0"
 
 declare -A RETENTION_HOURS=()
 declare -A MIN_RATIOS=()
@@ -597,6 +597,91 @@ show_policy_summary() {
   fi
 }
 
+emit_policy_snapshot() {
+  local scored_json="$1" selected_json="$2" total="$3" selected_hashes snapshot
+  selected_hashes="$(jq -c '[.[].hash]' <<<"${selected_json}")"
+  snapshot="$(jq -cn \
+    --arg run_id "${RUN_ID}" \
+    --arg timestamp "$(date --iso-8601=seconds)" \
+    --arg mode "${RUN_MODE}" \
+    --argjson total_torrents "${total}" \
+    --argjson torrents "${scored_json}" \
+    --argjson selected_hashes "${selected_hashes}" '
+      def selected($hash): ($selected_hashes | index($hash)) != null;
+      def rounded_average($values):
+        if ($values | length) > 0
+        then (($values | add / length * 100) | round / 100)
+        else 0 end;
+      ($torrents | length) as $managed
+      | ($torrents | map(.cleanup_score // 0)) as $scores
+      | {
+          event: "policy_snapshot",
+          run_id: $run_id,
+          timestamp: $timestamp,
+          mode: $mode,
+          total_torrents: $total_torrents,
+          managed_torrents: $managed,
+          unmanaged_torrents: ([$total_torrents - $managed, 0] | max),
+          managed_size_bytes: ([$torrents[] | (.size_bytes // 0)] | add // 0),
+          active_torrents: ([$torrents[] | select(.is_active_transfer)] | length),
+          upload_speed_bps: ([$torrents[] | (.upspeed // 0)] | add // 0),
+          history_ready: ([$torrents[] | select(.history_ready)] | length),
+          eligible_torrents: ([$torrents[] | select(.eligible)] | length),
+          selected_torrents: ($selected_hashes | length),
+          scores: {
+            average: rounded_average($scores),
+            minimum: ($scores | min // 0),
+            maximum: ($scores | max // 0)
+          },
+          categories: (
+            $torrents
+            | sort_by(.category // "")
+            | group_by(.category // "")
+            | map(
+                . as $items
+                | ($items | map(.cleanup_score // 0)) as $category_scores
+                | {
+                    category: ($items[0].category // ""),
+                    count: ($items | length),
+                    size_bytes: ([$items[] | (.size_bytes // 0)] | add // 0),
+                    upload_speed_bps: ([$items[] | (.upspeed // 0)] | add // 0),
+                    active: ([$items[] | select(.is_active_transfer)] | length),
+                    history_ready: ([$items[] | select(.history_ready)] | length),
+                    eligible: ([$items[] | select(.eligible)] | length),
+                    selected: ([$items[] | select(selected(.hash))] | length),
+                    average_score: rounded_average($category_scores),
+                    maximum_score: ($category_scores | max // 0)
+                  }
+              )
+            | sort_by(.size_bytes)
+            | reverse
+          ),
+          top_scores: (
+            $torrents
+            | sort_by(.cleanup_score, .size_bytes)
+            | reverse
+            | .[:5]
+            | map({
+                name: (.name // ""),
+                category: (.category // ""),
+                size_bytes: (.size_bytes // 0),
+                score: (.cleanup_score // 0),
+                upload_efficiency: (.upload_efficiency_mib_per_gib_day // 0),
+                upload_speed_bps: (.upspeed // 0),
+                inactive_hours: (.inactive_hours // 0),
+                ratio: (.ratio // 0),
+                seeds: (.swarm_seeds // 0),
+                leechers: (.swarm_leechers // 0),
+                history_ready: (.history_ready // false),
+                eligible: (.eligible // false),
+                selected: selected(.hash)
+              })
+          )
+        }
+    ')" || die "falha ao montar o resumo estruturado da politica"
+  emit_event "${snapshot}"
+}
+
 delete_torrents() {
   local selected_json="$1" count hashes response planned_bytes released_bytes event_time item
   count="$(jq 'length' <<<"${selected_json}")"
@@ -683,6 +768,7 @@ main() {
   choose_mode
   selected_json="$(select_candidates "${scored_json}")"
   show_policy_summary "${scored_json}" "${selected_json}" "$(jq 'length' <<<"${raw_json}")"
+  emit_policy_snapshot "${scored_json}" "${selected_json}" "$(jq 'length' <<<"${raw_json}")"
   save_state "${scored_json}" "${now_epoch}"
   delete_torrents "${selected_json}"
   emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
