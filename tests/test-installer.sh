@@ -7,6 +7,7 @@ trap 'rm -rf -- "${TEMP_ROOT}"' EXIT
 
 export QBIT_AUTODELETE_INSTALLER_LIBRARY=true
 export QBIT_INSTALL_SCRIPT="${TEMP_ROOT}/bin/qbit-autodelete"
+export QBIT_CONTROL_SCRIPT="${TEMP_ROOT}/bin/qbit-del"
 export QBIT_CONFIG_FILE="${TEMP_ROOT}/etc/qbit-autodelete.env"
 export QBIT_CATEGORIES_FILE="${TEMP_ROOT}/etc/qbit-autodelete.categories"
 export QBIT_SERVICE_FILE="${TEMP_ROOT}/systemd/qbit-autodelete.service"
@@ -23,6 +24,7 @@ assert_contains() { grep -Fq -- "$2" "$1" || fail "'$2' ausente em $1"; }
 assert_not_contains() { ! grep -Fq -- "$2" "$1" || fail "'$2' ainda presente em $1"; }
 
 mkdir -p "${TEMP_ROOT}/etc" "${TEMP_ROOT}/systemd" "${TEMP_ROOT}/storage"
+[[ -x "${SOURCE_CONTROL}" ]] || { printf 'FALHOU: qbit-del nao e executavel\n' >&2; exit 1; }
 
 SERVICE_USER="$(id -un)"
 SERVICE_GROUP="$(id -gn)"

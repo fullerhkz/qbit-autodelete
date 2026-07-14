@@ -1,0 +1,2 @@
+2026-07-13T22:00:00-03:00 [EVENT] QBIT_EVENT {"event":"run_started","run_id":"failed-run","timestamp":"2026-07-13T22:00:00-03:00","version":"3.1.0"}
+2026-07-13T22:00:10-03:00 [EVENT] QBIT_EVENT {"event":"run_failed","run_id":"failed-run","timestamp":"2026-07-13T22:00:10-03:00","message":"nao foi possivel autenticar no qBittorrent"}

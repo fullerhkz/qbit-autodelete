@@ -150,6 +150,7 @@ Os destinos padrao sao genericos:
 | Arquivo | Destino |
 |---|---|
 | programa | `/usr/local/bin/qbit-autodelete` |
+| controle global | `/usr/local/bin/qbit-del` |
 | configuracao | `/etc/qbit-autodelete.env` |
 | categorias | `/etc/qbit-autodelete.categories` |
 | estado | `/var/lib/qbit-autodelete/` |
@@ -169,12 +170,45 @@ As mesmas acoes podem ser abertas diretamente:
 ./install.sh uninstall
 ```
 
+## Comando global `qbit-del`
+
+O instalador adiciona `qbit-del` ao PATH do sistema. Ele pode ser chamado de qualquer
+diretorio e solicita `sudo` automaticamente nas operacoes que alteram o systemd ou
+leem o journal completo:
+
+```bash
+qbit-del run       # executa uma verificacao manual agora
+qbit-del stop      # para timer e servico
+qbit-del start     # inicia o timer e executa uma verificacao
+qbit-del restart   # reinicia timer e servico
+qbit-del status    # painel colorido do timer e da ultima execucao
+qbit-del log       # relatorio colorido da ultima execucao
+```
+
+`qbit-del status` mostra se o timer esta ativo e habilitado no boot, ultimo e proximo
+disparo, resultado e horarios da ultima execucao. Como o servico e `oneshot`, ele fica
+inativo depois de concluir; o painel diferencia esse estado de uma falha.
+
+`qbit-del log` le os eventos estruturados da ultima execucao no journal e apresenta:
+
+- data, hora, modo real ou `DRY_RUN` e resultado;
+- confirmacao da conexao com o qBittorrent;
+- torrents realmente removidos, agrupados por categoria;
+- horario, tamanho estimado e nome de cada torrent;
+- total removido e espaco estimado liberado.
+
+O relatorio nao registra nem exibe credenciais. O espaco e estimado porque hardlinks,
+snapshots e arquivos compartilhados podem mudar o ganho real no filesystem. Logs
+anteriores a instalacao desta versao continuam disponiveis no journal, mas nao possuem
+os eventos necessarios para montar o painel estruturado.
+
 ### Instalacao manual
 
 Se preferir nao usar o instalador, nao e necessario editar o script. Copie os dois modelos:
 
 ```bash
 sudo install -m 0755 qbit-autodelete.sh /PATH/TO/qbit-autodelete
+sudo install -m 0755 qbit-del /usr/local/bin/qbit-del
 sudo install -m 0640 -o root -g QBIT_SERVICE_GROUP example/qbit_autodelete.env /PATH/TO/qbit-autodelete.env
 sudo install -m 0644 example/qbit-autodelete.categories /PATH/TO/qbit-autodelete.categories
 sudo editor /PATH/TO/qbit-autodelete.env
