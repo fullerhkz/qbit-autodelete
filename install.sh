@@ -168,6 +168,32 @@ validate_url() {
   [[ "$1" =~ ^https?://[^/]+$ ]]
 }
 
+validate_host_url() {
+  [[ "$1" =~ ^https?://(\[[A-Za-z0-9:._%-]+\]|[A-Za-z0-9._-]+)$ ]]
+}
+
+validate_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+split_qbt_url() {
+  local url="$1"
+  PARSED_QBT_HOST="${url}"
+  PARSED_QBT_PORT="8080"
+
+  if [[ "${url}" =~ ^(https?://\[[^]]+\]):([0-9]+)$ ]]; then
+    PARSED_QBT_HOST="${BASH_REMATCH[1]}"
+    PARSED_QBT_PORT="${BASH_REMATCH[2]}"
+  elif [[ "${url}" =~ ^(https?://[^/:]+):([0-9]+)$ ]]; then
+    PARSED_QBT_HOST="${BASH_REMATCH[1]}"
+    PARSED_QBT_PORT="${BASH_REMATCH[2]}"
+  elif [[ "${url}" == https://* ]]; then
+    PARSED_QBT_PORT="443"
+  elif [[ "${url}" == http://* ]]; then
+    PARSED_QBT_PORT="80"
+  fi
+}
+
 validate_uint() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
@@ -358,11 +384,12 @@ categories_menu() {
 }
 
 collect_configuration() {
-  local existing="$1" default_user default_url default_qbt_user default_password
+  local existing="$1" default_user default_host default_port default_url default_qbt_user default_password
   local default_storage default_low default_high default_pressure default_dry category_source
 
   default_user="$(default_service_user)"
-  default_url="http://127.0.0.1:8080"
+  default_host="http://127.0.0.1"
+  default_port="8080"
   default_qbt_user=""
   default_password=""
   default_storage=""
@@ -374,6 +401,9 @@ collect_configuration() {
 
   if [[ "${existing}" == "true" && -r "${CONFIG_FILE}" ]]; then
     default_url="$(safe_config_value QBT_URL)"
+    split_qbt_url "${default_url}"
+    default_host="${PARSED_QBT_HOST}"
+    default_port="${PARSED_QBT_PORT}"
     default_qbt_user="$(safe_config_value QBT_USER)"
     default_password="$(safe_config_value QBT_PASS)"
     default_storage="$(safe_config_value STORAGE_PATH)"
@@ -395,11 +425,17 @@ collect_configuration() {
   SERVICE_GROUP="$(id -gn "${SERVICE_USER}")"
 
   while true; do
-    prompt QBT_URL_VALUE "URL da Web UI (Enter usa localhost)" "${default_url}" true
-    QBT_URL_VALUE="${QBT_URL_VALUE%/}"
-    validate_url "${QBT_URL_VALUE}" && break
-    warn "Use somente esquema, host e porta; exemplo: http://127.0.0.1:8080"
+    prompt QBT_HOST_VALUE "Endereco da Web UI (Enter usa localhost)" "${default_host}" true
+    QBT_HOST_VALUE="${QBT_HOST_VALUE%/}"
+    validate_host_url "${QBT_HOST_VALUE}" && break
+    warn "Use esquema e host, sem porta ou caminho; exemplo: http://127.0.0.1"
   done
+  while true; do
+    prompt QBT_PORT_VALUE "Porta da Web UI" "${default_port}" true
+    validate_port "${QBT_PORT_VALUE}" && break
+    warn "Informe uma porta entre 1 e 65535."
+  done
+  QBT_URL_VALUE="${QBT_HOST_VALUE}:${QBT_PORT_VALUE}"
   prompt QBT_USER_VALUE "Usuario da Web UI" "${default_qbt_user}" true
   prompt_secret QBT_PASS_VALUE "Senha da Web UI" "${default_password}"
 
@@ -445,7 +481,8 @@ show_summary() {
   printf '\n%s%sResumo da configuracao%s\n' "${CYAN}" "${BOLD}" "${RESET}"
   line
   printf '%-25s %s\n' "Usuario do servico:" "${SERVICE_USER} (${SERVICE_GROUP})"
-  printf '%-25s %s\n' "URL do qBittorrent:" "${QBT_URL_VALUE}"
+  printf '%-25s %s\n' "Endereco do qBittorrent:" "${QBT_HOST_VALUE}"
+  printf '%-25s %s\n' "Porta da Web UI:" "${QBT_PORT_VALUE}"
   printf '%-25s %s\n' "Usuario da Web UI:" "${QBT_USER_VALUE}"
   printf '%-25s %s\n' "Senha da Web UI:" "********"
   printf '%-25s %s\n' "Pressao de disco:" "${DISK_PRESSURE_VALUE}"
