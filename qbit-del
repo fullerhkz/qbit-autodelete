@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+SERVICE_NAME="${QBIT_DEL_SERVICE:-qbit-autodelete.service}"
+TIMER_NAME="${QBIT_DEL_TIMER:-qbit-autodelete.timer}"
+SYSTEMCTL="${QBIT_DEL_SYSTEMCTL:-systemctl}"
+JOURNALCTL="${QBIT_DEL_JOURNALCTL:-journalctl}"
+
+RESET="" BOLD="" DIM="" RED="" GREEN="" YELLOW="" BLUE="" CYAN=""
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  RESET=$'\033[0m' BOLD=$'\033[1m' DIM=$'\033[2m'
+  RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m'
+  BLUE=$'\033[34m' CYAN=$'\033[36m'
+fi
+
+info() { printf '%s[INFO]%s %s\n' "${BLUE}" "${RESET}" "$*"; }
+ok() { printf '%s[ OK ]%s %s\n' "${GREEN}" "${RESET}" "$*"; }
+warn() { printf '%s[AVISO]%s %s\n' "${YELLOW}" "${RESET}" "$*" >&2; }
+die() { printf '%s[ERRO]%s %s\n' "${RED}" "${RESET}" "$*" >&2; exit 1; }
+line() { printf '%s\n' "${DIM}----------------------------------------------------------------${RESET}"; }
+
+header() {
+  local title="$1"
+  printf '\n%s%s+--------------------------------------------------------------+%s\n' "${CYAN}" "${BOLD}" "${RESET}"
+  printf '%s%s| %-60s |%s\n' "${CYAN}" "${BOLD}" "${title}" "${RESET}"
+  printf '%s%s+--------------------------------------------------------------+%s\n' "${CYAN}" "${BOLD}" "${RESET}"
+}
+
+usage() {
+  cat <<'EOF'
+Uso: qbit-del COMANDO
+
+  run       executa a limpeza manualmente agora
+  stop      para o timer e qualquer execucao ativa
+  start     inicia o timer e executa uma verificacao agora
+  restart   reinicia timer e servico
+  status    mostra o estado do servico e do timer
+  log       resume a ultima execucao e as exclusoes por categoria
+  help      mostra esta ajuda
+EOF
+}
+
+require_commands() {
+  local command_name
+  for command_name in "${SYSTEMCTL}" jq awk date; do
+    command -v "${command_name}" >/dev/null 2>&1 || die "comando ausente: ${command_name}"
+  done
+}
+
+require_root() {
+  local action="$1" self
+  [[ "${QBIT_DEL_SKIP_ROOT:-false}" == "true" ]] && return 0
+  ((EUID == 0)) && return 0
+  command -v sudo >/dev/null 2>&1 || die "execute com sudo: sudo qbit-del ${action}"
+  self="$(command -v "$0" 2>/dev/null || printf '%s' "$0")"
+  exec sudo --preserve-env=NO_COLOR -- "${self}" "${action}"
+}
+
+unit_loaded() {
+  [[ "$("${SYSTEMCTL}" show "${1}" --property=LoadState --value 2>/dev/null || true)" == "loaded" ]]
+}
+
+require_installation() {
+  [[ "${QBIT_DEL_SKIP_INSTALL_CHECK:-false}" == "true" ]] && return 0
+  unit_loaded "${SERVICE_NAME}" && unit_loaded "${TIMER_NAME}" ||
+    die "qbit-autodelete nao esta instalado ou o systemd ainda nao foi recarregado"
+}
+
+property() {
+  "${SYSTEMCTL}" show "$1" --property="$2" --value 2>/dev/null || true
+}
+
+state_badge() {
+  local state="$1"
+  case "${state}" in
+    active|success|enabled) printf '%s%s%s' "${GREEN}" "${state}" "${RESET}" ;;
+    activating|deactivating|reloading) printf '%s%s%s' "${YELLOW}" "${state}" "${RESET}" ;;
+    *) printf '%s%s%s' "${RED}" "${state:-desconhecido}" "${RESET}" ;;
+  esac
+}
+
+format_datetime() {
+  local value="$1"
+  [[ -n "${value}" && "${value}" != "n/a" ]] || { printf '%s' "nao disponivel"; return; }
+  date -d "${value}" '+%d/%m/%Y %H:%M:%S %Z' 2>/dev/null || printf '%s' "${value}"
+}
+
+format_time() {
+  local value="$1"
+  date -d "${value}" '+%H:%M:%S' 2>/dev/null || printf '%s' "--:--:--"
+}
+
+human_bytes() {
+  awk -v bytes="${1:-0}" 'BEGIN {
+    if (bytes >= 1099511627776) printf "%.2f TiB", bytes / 1099511627776;
+    else if (bytes >= 1073741824) printf "%.2f GiB", bytes / 1073741824;
+    else if (bytes >= 1048576) printf "%.2f MiB", bytes / 1048576;
+    else if (bytes >= 1024) printf "%.2f KiB", bytes / 1024;
+    else printf "%d B", bytes;
+  }'
+}
+
+cmd_run() {
+  require_root run
+  require_installation
+  header "qbit-del run - execucao manual"
+  if [[ "$(property "${SERVICE_NAME}" ActiveState)" == "active" ]]; then
+    warn "Uma execucao ja esta em andamento; nenhuma segunda instancia foi iniciada."
+    return 0
+  fi
+  info "Executando ${SERVICE_NAME}..."
+  if "${SYSTEMCTL}" start "${SERVICE_NAME}"; then
+    ok "Execucao manual concluida. Use 'qbit-del log' para ver o resumo."
+  else
+    warn "A execucao terminou com erro."
+    cmd_log
+    return 1
+  fi
+}
+
+cmd_stop() {
+  require_root stop
+  require_installation
+  header "qbit-del stop - parar automacao"
+  "${SYSTEMCTL}" stop "${TIMER_NAME}"
+  "${SYSTEMCTL}" stop "${SERVICE_NAME}"
+  ok "Timer parado; nenhuma nova limpeza sera iniciada ate 'qbit-del start'."
+}
+
+start_units() {
+  "${SYSTEMCTL}" start "${TIMER_NAME}"
+  "${SYSTEMCTL}" start "${SERVICE_NAME}"
+}
+
+cmd_start() {
+  require_root start
+  require_installation
+  header "qbit-del start - iniciar automacao"
+  info "Iniciando timer e executando uma verificacao agora..."
+  if start_units; then
+    ok "Timer ativo e verificacao concluida."
+  else
+    warn "O timer foi iniciado, mas a verificacao terminou com erro."
+    return 1
+  fi
+}
+
+cmd_restart() {
+  require_root restart
+  require_installation
+  header "qbit-del restart - reiniciar automacao"
+  "${SYSTEMCTL}" stop "${TIMER_NAME}"
+  "${SYSTEMCTL}" stop "${SERVICE_NAME}"
+  info "Iniciando novamente..."
+  if start_units; then
+    ok "Timer reiniciado e nova verificacao concluida."
+  else
+    warn "A reinicializacao terminou com erro."
+    return 1
+  fi
+}
+
+cmd_status() {
+  require_installation
+  local timer_active timer_enabled service_active service_result service_status
+  local last_start last_end last_trigger next_trigger
+  timer_active="$(property "${TIMER_NAME}" ActiveState)"
+  timer_enabled="$(property "${TIMER_NAME}" UnitFileState)"
+  service_active="$(property "${SERVICE_NAME}" ActiveState)"
+  service_result="$(property "${SERVICE_NAME}" Result)"
+  service_status="$(property "${SERVICE_NAME}" ExecMainStatus)"
+  last_start="$(property "${SERVICE_NAME}" ExecMainStartTimestamp)"
+  last_end="$(property "${SERVICE_NAME}" ExecMainExitTimestamp)"
+  last_trigger="$(property "${TIMER_NAME}" LastTriggerUSec)"
+  next_trigger="$(property "${TIMER_NAME}" NextElapseUSecRealtime)"
+
+  header "qbit-del status - servico e timer"
+  printf '%s%sAGENDAMENTO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  printf '  %-24s %s\n' "Timer:" "$(state_badge "${timer_active}")"
+  printf '  %-24s %s\n' "Inicializacao no boot:" "$(state_badge "${timer_enabled}")"
+  printf '  %-24s %s\n' "Ultimo disparo:" "$(format_datetime "${last_trigger}")"
+  printf '  %-24s %s\n' "Proximo disparo:" "$(format_datetime "${next_trigger}")"
+
+  printf '\n%s%sULTIMA EXECUCAO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  if [[ "${service_active}" =~ ^(active|activating)$ ]]; then
+    printf '  %-24s %s\n' "Servico:" "$(state_badge "${service_active}") - em execucao"
+  elif [[ "${service_result}" == "success" && "${service_status:-0}" == "0" ]]; then
+    printf '  %-24s %sconcluida com sucesso%s (oneshot)\n' "Servico:" "${GREEN}" "${RESET}"
+  elif [[ -n "${service_result}" ]]; then
+    printf '  %-24s %sfalhou%s (%s, codigo %s)\n' "Servico:" "${RED}" "${RESET}" \
+      "${service_result}" "${service_status:-?}"
+  else
+    printf '  %-24s %ssem execucao registrada%s\n' "Servico:" "${YELLOW}" "${RESET}"
+  fi
+  printf '  %-24s %s\n' "Inicio:" "$(format_datetime "${last_start}")"
+  printf '  %-24s %s\n' "Termino:" "$(format_datetime "${last_end}")"
+  printf '\n%sDica:%s use %sqbit-del log%s para o relatorio da ultima execucao.\n' \
+    "${BLUE}" "${RESET}" "${BOLD}" "${RESET}"
+}
+
+read_journal() {
+  if [[ -n "${QBIT_DEL_JOURNAL_FILE:-}" ]]; then
+    [[ -r "${QBIT_DEL_JOURNAL_FILE}" ]] || die "arquivo de journal nao legivel"
+    command cat -- "${QBIT_DEL_JOURNAL_FILE}"
+  else
+    "${JOURNALCTL}" -u "${SERVICE_NAME}" --no-pager -o cat -n "${QBIT_DEL_LOG_LINES:-5000}"
+  fi
+}
+
+extract_events() {
+  awk '
+    {
+      marker = "QBIT_EVENT ";
+      position = index($0, marker);
+      if (position > 0) print substr($0, position + length(marker));
+    }
+  '
+}
+
+legacy_log() {
+  local journal="$1"
+  warn "Nenhuma execucao estruturada foi encontrada. Execute 'qbit-del run' com a versao atual."
+  printf '\n%sUltimas linhas disponiveis:%s\n' "${BOLD}" "${RESET}"
+  tail -n 25 <<<"${journal}"
+}
+
+cmd_log() {
+  require_root log
+  require_installation
+  if [[ -z "${QBIT_DEL_JOURNAL_FILE:-}" ]]; then
+    command -v "${JOURNALCTL}" >/dev/null 2>&1 || die "comando ausente: ${JOURNALCTL}"
+  fi
+  local journal event_lines events last_run run start configured connection completed failure summary deleted
+  local start_time end_time run_mode result_text connection_text count planned_count released planned
+  journal="$(read_journal 2>/dev/null || true)"
+  event_lines="$(extract_events <<<"${journal}")"
+  if [[ -z "${event_lines}" ]]; then
+    header "qbit-del log - ultima execucao"
+    legacy_log "${journal}"
+    return 0
+  fi
+
+  events="$(jq -Rsc '[split("\n")[] | select(length > 0) | (fromjson? // empty)]' <<<"${event_lines}")"
+  last_run="$(jq -r '[.[] | select(.event == "run_started")] | last | .run_id // empty' <<<"${events}")"
+  [[ -n "${last_run}" ]] || { header "qbit-del log - ultima execucao"; legacy_log "${journal}"; return 0; }
+  run="$(jq -c --arg run_id "${last_run}" '[.[] | select(.run_id == $run_id)]' <<<"${events}")"
+  start="$(jq -c '[.[] | select(.event == "run_started")] | last // {}' <<<"${run}")"
+  configured="$(jq -c '[.[] | select(.event == "run_configured")] | last // {}' <<<"${run}")"
+  connection="$(jq -c '[.[] | select(.event == "connection")] | last // {}' <<<"${run}")"
+  completed="$(jq -c '[.[] | select(.event == "run_completed")] | last // {}' <<<"${run}")"
+  failure="$(jq -c '[.[] | select(.event == "run_failed")] | last // {}' <<<"${run}")"
+  summary="$(jq -c '[.[] | select(.event == "deletion_summary")] | last // {}' <<<"${run}")"
+  deleted="$(jq -c '[.[] | select(.event == "torrent_deleted")]' <<<"${run}")"
+
+  start_time="$(jq -r '.timestamp // ""' <<<"${start}")"
+  end_time="$(jq -r '.timestamp // ""' <<<"${completed}")"
+  [[ -n "${end_time}" ]] || end_time="$(jq -r '.timestamp // ""' <<<"${failure}")"
+  if [[ "$(jq -r 'has("dry_run")' <<<"${configured}")" == "true" ]]; then
+    run_mode="$(jq -r 'if .dry_run == true then "SIMULACAO" else "REAL" end' <<<"${configured}")"
+  elif [[ "$(jq -r 'has("dry_run")' <<<"${start}")" == "true" ]]; then
+    run_mode="$(jq -r 'if .dry_run == true then "SIMULACAO" else "REAL" end' <<<"${start}")"
+  else
+    run_mode="NAO INICIADO"
+  fi
+  count="$(jq -r '.deleted_count // 0' <<<"${summary}")"
+  planned_count="$(jq -r '.planned_count // 0' <<<"${summary}")"
+  released="$(jq -r '.released_bytes // 0' <<<"${summary}")"
+  planned="$(jq -r '.planned_bytes // 0' <<<"${summary}")"
+
+  if [[ "$(jq -r '.success // false' <<<"${connection}")" == "true" ]]; then
+    connection_text="${GREEN}SUCESSO${RESET}"
+  else
+    connection_text="${RED}NAO CONFIRMADA${RESET}"
+  fi
+  if [[ "$(jq -r '.success // false' <<<"${completed}")" == "true" ]]; then
+    result_text="${GREEN}CONCLUIDA${RESET}"
+  elif [[ "$(jq 'length' <<<"${failure}")" -eq 0 && \
+    "$(property "${SERVICE_NAME}" ActiveState)" =~ ^(active|activating)$ ]]; then
+    result_text="${YELLOW}EM ANDAMENTO${RESET}"
+  else
+    result_text="${RED}FALHOU${RESET}"
+  fi
+
+  header "qbit-del log - ultima execucao"
+  printf '%s%sRESUMO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  printf '  %-24s %s\n' "Inicio:" "$(format_datetime "${start_time}")"
+  printf '  %-24s %s\n' "Termino:" "$(format_datetime "${end_time}")"
+  printf '  %-24s %s\n' "Modo:" "${run_mode}"
+  printf '  %-24s %b\n' "Conexao qBittorrent:" "${connection_text}"
+  printf '  %-24s %b\n' "Resultado:" "${result_text}"
+  if [[ "$(jq 'length' <<<"${failure}")" -gt 0 ]]; then
+    printf '  %-24s %s\n' "Erro:" "$(jq -r '.message // "erro nao informado" | gsub("[\\r\\n\\t]"; " ")' <<<"${failure}")"
+  fi
+
+  printf '\n%s%sEXCLUSOES%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  if [[ "${run_mode}" == "SIMULACAO" ]]; then
+    printf '  %sNenhum torrent foi excluido (DRY_RUN).%s\n' "${YELLOW}" "${RESET}"
+    printf '  Candidatos simulados: %s | Espaco planejado: %s\n' \
+      "${planned_count}" "$(human_bytes "${planned}")"
+  elif ((count == 0)); then
+    printf '  Nenhum torrent foi excluido nesta execucao.\n'
+  else
+    local group category group_count group_bytes item item_time item_size item_name
+    while IFS= read -r group; do
+      category="$(jq -r '.[0].category // "" | if length == 0 then "(sem categoria)" else . end | gsub("[\\r\\n\\t]"; " ")' <<<"${group}")"
+      group_count="$(jq 'length' <<<"${group}")"
+      group_bytes="$(jq '[.[].released_bytes] | add // 0' <<<"${group}")"
+      printf '\n  %s%s%s  %s torrent(s) | %s\n' "${BOLD}" "${category}" "${RESET}" \
+        "${group_count}" "$(human_bytes "${group_bytes}")"
+      while IFS= read -r item; do
+        item_time="$(format_time "$(jq -r '.timestamp' <<<"${item}")")"
+        item_size="$(human_bytes "$(jq -r '.released_bytes // 0' <<<"${item}")")"
+        item_name="$(jq -r '.name // "(sem nome)" | gsub("[\\r\\n\\t]"; " ")' <<<"${item}")"
+        printf '    %s  %-10s  %s\n' "${item_time}" "${item_size}" "${item_name}"
+      done < <(jq -c '.[]' <<<"${group}")
+    done < <(jq -c 'sort_by(.category // "") | group_by(.category // "")[]' <<<"${deleted}")
+  fi
+
+  printf '\n%s%sTOTAL%s\n' "${BOLD}" "${CYAN}" "${RESET}"
+  line
+  printf '  %-24s %s\n' "Torrents removidos:" "${count}"
+  printf '  %-24s %s%s%s\n' "Espaco estimado:" "${GREEN}" "$(human_bytes "${released}")" "${RESET}"
+  printf '  %sO valor e estimado; hardlinks e snapshots podem alterar o ganho real.%s\n' "${DIM}" "${RESET}"
+}
+
+main() {
+  case "${1:-help}" in
+    help|-h|--help) usage ;;
+    version|-v|--version) printf 'qbit-del %s\n' "${VERSION}" ;;
+    run|stop|start|restart|status|log)
+      require_commands
+      case "$1" in
+        run) cmd_run ;;
+        stop) cmd_stop ;;
+        start) cmd_start ;;
+        restart) cmd_restart ;;
+        status) cmd_status ;;
+        log) cmd_log ;;
+      esac
+      ;;
+    *) usage >&2; die "comando desconhecido: $1" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,10 @@
+2026-07-13T20:00:00-03:00 [EVENT] QBIT_EVENT {"event":"run_started","run_id":"old-run","timestamp":"2026-07-13T20:00:00-03:00","version":"3.1.0","dry_run":false}
+2026-07-13T20:00:01-03:00 [EVENT] QBIT_EVENT {"event":"run_completed","run_id":"old-run","timestamp":"2026-07-13T20:00:01-03:00","success":true}
+2026-07-13T21:15:00-03:00 [EVENT] QBIT_EVENT {"event":"run_started","run_id":"latest-run","timestamp":"2026-07-13T21:15:00-03:00","version":"3.1.0","dry_run":false}
+2026-07-13T21:15:00-03:00 [EVENT] QBIT_EVENT {"event":"run_configured","run_id":"latest-run","timestamp":"2026-07-13T21:15:00-03:00","version":"3.1.0","dry_run":false}
+2026-07-13T21:15:01-03:00 [EVENT] QBIT_EVENT {"event":"connection","run_id":"latest-run","timestamp":"2026-07-13T21:15:01-03:00","success":true}
+2026-07-13T21:15:03-03:00 [EVENT] QBIT_EVENT {"event":"torrent_deleted","run_id":"latest-run","timestamp":"2026-07-13T21:15:03-03:00","name":"Filme A","category":"Categoria-Filmes","size_bytes":5368709120,"released_bytes":5368709120}
+2026-07-13T21:15:03-03:00 [EVENT] QBIT_EVENT {"event":"torrent_deleted","run_id":"latest-run","timestamp":"2026-07-13T21:15:03-03:00","name":"Filme B","category":"Categoria-Filmes","size_bytes":2147483648,"released_bytes":2147483648}
+2026-07-13T21:15:03-03:00 [EVENT] QBIT_EVENT {"event":"torrent_deleted","run_id":"latest-run","timestamp":"2026-07-13T21:15:03-03:00","name":"Serie A","category":"Categoria-Series","size_bytes":1073741824,"released_bytes":1073741824}
+2026-07-13T21:15:03-03:00 [EVENT] QBIT_EVENT {"event":"deletion_summary","run_id":"latest-run","timestamp":"2026-07-13T21:15:03-03:00","dry_run":false,"delete_files":true,"planned_count":3,"planned_bytes":8589934592,"deleted_count":3,"released_bytes":8589934592}
+2026-07-13T21:15:04-03:00 [EVENT] QBIT_EVENT {"event":"run_completed","run_id":"latest-run","timestamp":"2026-07-13T21:15:04-03:00","success":true}

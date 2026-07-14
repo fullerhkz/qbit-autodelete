@@ -33,7 +33,11 @@ class Handler(BaseHTTPRequestHandler):
             self.reply()
             return
         if self.path == "/api/v2/torrents/delete":
-            self.reply(500, b"dry-run should not call delete")
+            if len(sys.argv) < 3:
+                self.reply(500, b"delete recorder is required")
+                return
+            Path(sys.argv[2]).write_bytes(body)
+            self.reply()
             return
         self.reply(404)
 

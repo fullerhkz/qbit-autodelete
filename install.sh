@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.1.0"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SOURCE_SCRIPT="${PROJECT_DIR}/qbit-autodelete.sh"
+SOURCE_CONTROL="${PROJECT_DIR}/qbit-del"
 SOURCE_ENV="${PROJECT_DIR}/example/qbit_autodelete.env"
 SOURCE_CATEGORIES="${PROJECT_DIR}/example/qbit-autodelete.categories"
 SOURCE_SERVICE="${PROJECT_DIR}/example/qbit-autodelete.service"
 SOURCE_TIMER="${PROJECT_DIR}/example/qbit-autodelete.timer"
 
 INSTALL_SCRIPT="${QBIT_INSTALL_SCRIPT:-/usr/local/bin/qbit-autodelete}"
+CONTROL_SCRIPT="${QBIT_CONTROL_SCRIPT:-/usr/local/bin/qbit-del}"
 CONFIG_FILE="${QBIT_CONFIG_FILE:-/etc/qbit-autodelete.env}"
 CATEGORIES_FILE="${QBIT_CATEGORIES_FILE:-/etc/qbit-autodelete.categories}"
 SERVICE_FILE="${QBIT_SERVICE_FILE:-/etc/systemd/system/qbit-autodelete.service}"
@@ -83,7 +85,7 @@ require_root() {
 
 require_assets() {
   local file
-  for file in "${SOURCE_SCRIPT}" "${SOURCE_ENV}" "${SOURCE_CATEGORIES}" \
+  for file in "${SOURCE_SCRIPT}" "${SOURCE_CONTROL}" "${SOURCE_ENV}" "${SOURCE_CATEGORIES}" \
     "${SOURCE_SERVICE}" "${SOURCE_TIMER}"; do
     [[ -r "${file}" ]] || die "arquivo do pacote ausente: ${file}"
   done
@@ -493,6 +495,7 @@ show_summary() {
   printf '%-25s %s\n' "DRY_RUN:" "${DRY_RUN_VALUE}"
   printf '%-25s %s\n' "Categorias:" "${#CATEGORIES[@]}"
   printf '%-25s %s\n' "Executavel:" "${INSTALL_SCRIPT}"
+  printf '%-25s %s\n' "Comando de controle:" "${CONTROL_SCRIPT}"
   printf '%-25s %s\n' "Configuracao:" "${CONFIG_FILE}"
   line
 }
@@ -614,9 +617,10 @@ install_files() {
     "${WORK_DIR}/qbit-autodelete.categories"
 
   systemctl disable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
-  create_backup "${INSTALL_SCRIPT}" "${CONFIG_FILE}" "${CATEGORIES_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}"
+  create_backup "${INSTALL_SCRIPT}" "${CONTROL_SCRIPT}" "${CONFIG_FILE}" "${CATEGORIES_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}"
 
   install -D -m 0755 -o root -g root "${SOURCE_SCRIPT}" "${INSTALL_SCRIPT}"
+  install -D -m 0755 -o root -g root "${SOURCE_CONTROL}" "${CONTROL_SCRIPT}"
   install -D -m 0640 -o root -g "${SERVICE_GROUP}" "${WORK_DIR}/qbit-autodelete.env" "${CONFIG_FILE}"
   install -D -m 0644 -o root -g root "${WORK_DIR}/qbit-autodelete.categories" "${CATEGORIES_FILE}"
   install -D -m 0644 -o root -g root "${WORK_DIR}/qbit-autodelete.service" "${SERVICE_FILE}"
@@ -646,6 +650,8 @@ install_files() {
   printf '\nComandos uteis:\n'
   printf '  systemctl status %s\n' "${TIMER_NAME}"
   printf '  journalctl -u %s -n 100 --no-pager\n' "${SERVICE_NAME}"
+  printf '  qbit-del status\n'
+  printf '  qbit-del log\n'
   printf '  sudo %s reconfigure\n' "${BASH_SOURCE[0]}"
 }
 
@@ -696,7 +702,7 @@ update_flow() {
   [[ -n "${SERVICE_USER}" ]] && id "${SERVICE_USER}" >/dev/null 2>&1 ||
     die "nao foi possivel determinar o usuario do servico"
   SERVICE_GROUP="$(id -gn "${SERVICE_USER}")"
-  printf 'O script, o service e o timer serao atualizados.\n'
+  printf 'O script, o comando qbit-del, o service e o timer serao atualizados.\n'
   printf 'O .env e as categorias serao preservados sem alteracao.\n\n'
   printf '%-22s %s\n' "Usuario:" "${SERVICE_USER}"
   printf '%-22s %s\n' "Executavel:" "${INSTALL_SCRIPT}"
@@ -710,8 +716,9 @@ update_flow() {
   chmod 0750 "${WORK_DIR}"
   validate_config_as_user "${WORK_DIR}/qbit-autodelete" "${CONFIG_FILE}"
   systemctl disable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
-  create_backup "${INSTALL_SCRIPT}" "${SERVICE_FILE}" "${TIMER_FILE}"
+  create_backup "${INSTALL_SCRIPT}" "${CONTROL_SCRIPT}" "${SERVICE_FILE}" "${TIMER_FILE}"
   install -D -m 0755 -o root -g root "${SOURCE_SCRIPT}" "${INSTALL_SCRIPT}"
+  install -D -m 0755 -o root -g root "${SOURCE_CONTROL}" "${CONTROL_SCRIPT}"
   install -D -m 0644 -o root -g root "${WORK_DIR}/qbit-autodelete.service" "${SERVICE_FILE}"
   install -D -m 0644 -o root -g root "${SOURCE_TIMER}" "${TIMER_FILE}"
   if command -v systemd-analyze >/dev/null 2>&1; then
@@ -729,7 +736,7 @@ status_flow() {
   header
   printf '%s%sArquivos%s\n' "${CYAN}" "${BOLD}" "${RESET}"
   local path
-  for path in "${INSTALL_SCRIPT}" "${CONFIG_FILE}" "${CATEGORIES_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}"; do
+  for path in "${INSTALL_SCRIPT}" "${CONTROL_SCRIPT}" "${CONFIG_FILE}" "${CATEGORIES_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}"; do
     if [[ -e "${path}" ]]; then
       printf '  %s[OK]%s %s\n' "${GREEN}" "${RESET}" "${path}"
     else
@@ -760,9 +767,9 @@ uninstall_flow() {
   ask_yes_no "Desinstalar qbit-autodelete?" no
   [[ "${REPLY_BOOL}" == "true" ]] || die "desinstalacao cancelada"
 
-  create_backup "${INSTALL_SCRIPT}" "${CONFIG_FILE}" "${CATEGORIES_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}"
+  create_backup "${INSTALL_SCRIPT}" "${CONTROL_SCRIPT}" "${CONFIG_FILE}" "${CATEGORIES_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}"
   systemctl disable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
-  rm -f -- "${INSTALL_SCRIPT}" "${SERVICE_FILE}" "${TIMER_FILE}"
+  rm -f -- "${INSTALL_SCRIPT}" "${CONTROL_SCRIPT}" "${SERVICE_FILE}" "${TIMER_FILE}"
 
   ask_yes_no "Remover tambem .env e categorias?" no
   if [[ "${REPLY_BOOL}" == "true" ]]; then

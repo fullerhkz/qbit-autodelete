@@ -3,13 +3,14 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.0.0"
+VERSION="3.1.0"
 
 declare -A RETENTION_HOURS=()
 declare -A MIN_RATIOS=()
 COOKIE_JAR=""
 CLI_DRY_RUN=""
 ACTION="run"
+RUN_ID=""
 
 log() {
   local level="$1"
@@ -18,8 +19,16 @@ log() {
 }
 
 die() {
+  if [[ -n "${RUN_ID}" ]] && command -v jq >/dev/null 2>&1; then
+    emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+      --arg message "$*" '{event:"run_failed", run_id:$run_id, timestamp:$timestamp, message:$message}')" || true
+  fi
   log "ERRO" "$*" >&2
   exit 1
+}
+
+emit_event() {
+  log "EVENT" "QBIT_EVENT $1"
 }
 
 usage() {
@@ -293,6 +302,8 @@ login_qbittorrent() {
       "${QBT_URL}/api/v2/auth/login" 2>/dev/null || true)"
     if [[ "${response}" == "Ok." ]]; then
       log "INFO" "sessao autenticada no qBittorrent"
+      emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+        '{event:"connection", run_id:$run_id, timestamp:$timestamp, success:true}')"
       return 0
     fi
     ((attempt < LOGIN_RETRIES)) && sleep 2
@@ -587,12 +598,24 @@ show_policy_summary() {
 }
 
 delete_torrents() {
-  local selected_json="$1" count hashes response
+  local selected_json="$1" count hashes response planned_bytes released_bytes event_time item
   count="$(jq 'length' <<<"${selected_json}")"
-  ((count > 0)) || return 0
+  planned_bytes="$(jq '[.[].size_bytes] | add // 0' <<<"${selected_json}")"
+
+  if ((count == 0)); then
+    emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+      --argjson dry_run "${DRY_RUN}" \
+      '{event:"deletion_summary", run_id:$run_id, timestamp:$timestamp, dry_run:$dry_run,
+        planned_count:0, planned_bytes:0, deleted_count:0, released_bytes:0}')"
+    return 0
+  fi
 
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "DRY-RUN" "nenhuma exclusao executada"
+    emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+      --argjson planned_count "${count}" --argjson planned_bytes "${planned_bytes}" \
+      '{event:"deletion_summary", run_id:$run_id, timestamp:$timestamp, dry_run:true,
+        planned_count:$planned_count, planned_bytes:$planned_bytes, deleted_count:0, released_bytes:0}')"
     return 0
   fi
 
@@ -602,20 +625,51 @@ delete_torrents() {
     "${QBT_URL}/api/v2/torrents/delete")" || die "a API recusou a exclusao"
   [[ -z "${response}" ]] || log "AVISO" "resposta inesperada da API ao excluir: ${response}"
   log "OK" "${count} torrent(s) removido(s); deleteFiles=${DELETE_FILES}"
+
+  event_time="$(date --iso-8601=seconds)"
+  released_bytes=0
+  [[ "${DELETE_FILES}" == "false" ]] || released_bytes="${planned_bytes}"
+  while IFS= read -r item; do
+    emit_event "${item}"
+  done < <(jq -c --arg run_id "${RUN_ID}" --arg timestamp "${event_time}" \
+    --argjson delete_files "${DELETE_FILES}" '
+      .[] | {
+        event:"torrent_deleted", run_id:$run_id, timestamp:$timestamp,
+        name:(.name // ""), category:(.category // ""), size_bytes:(.size_bytes // 0),
+        released_bytes:(if $delete_files then (.size_bytes // 0) else 0 end)
+      }' <<<"${selected_json}")
+  emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "${event_time}" \
+    --argjson planned_count "${count}" --argjson planned_bytes "${planned_bytes}" \
+    --argjson deleted_count "${count}" --argjson released_bytes "${released_bytes}" \
+    --argjson delete_files "${DELETE_FILES}" \
+    '{event:"deletion_summary", run_id:$run_id, timestamp:$timestamp, dry_run:false,
+      delete_files:$delete_files, planned_count:$planned_count, planned_bytes:$planned_bytes,
+      deleted_count:$deleted_count, released_bytes:$released_bytes}')"
 }
 
 main() {
   parse_args "$@"
-  load_config
-  validate_config
 
   if [[ "${ACTION}" == "check-config" ]]; then
+    load_config
+    validate_config
     log "OK" "configuracao valida; ${#RETENTION_HOURS[@]} regra(s) de categoria carregada(s)"
     return 0
   fi
 
+  RUN_ID="$(date +%s)-$$-${RANDOM}"
+  if command -v jq >/dev/null 2>&1; then
+    emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+      --arg version "${VERSION}" \
+      '{event:"run_started", run_id:$run_id, timestamp:$timestamp, version:$version}')"
+  fi
+  load_config
+  validate_config
   setup_runtime
   log "INFO" "qbit-autodelete ${VERSION} iniciado; dry_run=${DRY_RUN}"
+  emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+    --arg version "${VERSION}" --argjson dry_run "${DRY_RUN}" \
+    '{event:"run_configured", run_id:$run_id, timestamp:$timestamp, version:$version, dry_run:$dry_run}')"
   [[ "${ALLOW_INCOMPLETE_DELETE}" == "true" ]] && log "AVISO" "exclusao de torrents incompletos esta habilitada"
   login_qbittorrent
 
@@ -631,6 +685,8 @@ main() {
   show_policy_summary "${scored_json}" "${selected_json}" "$(jq 'length' <<<"${raw_json}")"
   save_state "${scored_json}" "${now_epoch}"
   delete_torrents "${selected_json}"
+  emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+    '{event:"run_completed", run_id:$run_id, timestamp:$timestamp, success:true}')"
   log "INFO" "execucao concluida"
 }
 
