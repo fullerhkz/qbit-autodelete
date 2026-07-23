@@ -1,8 +1,8 @@
 # qbit-autodelete inteligente
 
 Limpeza segura de torrents do qBittorrent orientada a **maximizar upload por GiB
-armazenado**, com historico persistente, retencao e ratio por categoria e modo
-agressivo opcional quando o filesystem fica com pouco espaco.
+armazenado**, com historico persistente, retencao e ratio por categoria, limpeza sob
+pressao e uma faixa de emergencia para impedir que o filesystem fique cheio.
 
 ## O que significa o gatilho de "XYZ GB"
 
@@ -13,13 +13,15 @@ watermark*. Ele nao deve ser fixo para qualquer servidor.
 Esta versao aceita GB, percentual ou ambos:
 
 ```text
-livre >= piso                    modo normal
-livre < piso                     modo agressivo
-modo agressivo tenta chegar      ao alvo
+livre >= gatilho agressivo                modo normal
+critico <= livre < gatilho agressivo      modo agressivo
+livre < critico                            modo emergencia
+modos de pressao tentam chegar             ao alvo
 ```
 
 Quando GB e percentual estao configurados, vale o maior limite. Em um volume grande,
-uma configuracao somente percentual como `10% -> 15%` costuma ser mais coerente.
+uma configuracao somente percentual como `10% / 20% / 30%` (emergencia, agressivo e
+alvo) costuma ser mais coerente.
 
 ## Perfil recomendado: RAID0 unico e racing pelo autobrr
 
@@ -33,19 +35,26 @@ DISK_PRESSURE_ENABLED="true"
 STORAGE_PATH="/PATH/TO/RAID/MOUNT"
 LOW_WATERMARK_GB="0"
 HIGH_WATERMARK_GB="0"
-LOW_WATERMARK_PERCENT="10"
-HIGH_WATERMARK_PERCENT="15"
+CRITICAL_WATERMARK_GB="0"
+CRITICAL_WATERMARK_PERCENT="10"
+LOW_WATERMARK_PERCENT="20"
+HIGH_WATERMARK_PERCENT="30"
 
-NORMAL_MIN_SCORE="70"
-AGGRESSIVE_MIN_SCORE="35"
+NORMAL_MIN_SCORE="65"
+AGGRESSIVE_MIN_SCORE="30"
 AGGRESSIVE_WITHOUT_HISTORY="false"
-MAX_DELETE_PER_RUN="15"
-MAX_RECLAIM_GB_PER_RUN="400"
+MAX_DELETE_PER_RUN="20"
+MAX_RECLAIM_GB_PER_RUN="500"
+
+EMERGENCY_MIN_SCORE="0"
+EMERGENCY_WITHOUT_HISTORY="true"
+EMERGENCY_MAX_DELETE_PER_RUN="30"
+EMERGENCY_MAX_RECLAIM_GB_PER_RUN="800"
 ```
 
-Em um volume nominal proximo de 6 TB, os percentuais reservam aproximadamente 10% para
-acionar a limpeza agressiva e buscam retornar a 15%; os bytes exatos dependem da
-capacidade que o filesystem reporta. Essa folga absorve entradas simultaneas do autobrr.
+Em um volume nominal proximo de 6 TB, a limpeza reage antes, com 20% livres, e busca
+retornar a 30%. A emergencia entra abaixo de 10%; os bytes exatos dependem da capacidade
+que o filesystem reporta. Essa folga absorve varias entradas simultaneas do autobrr.
 
 `AGGRESSIVE_WITHOUT_HISTORY=false` impede que um torrent recem-adicionado seja julgado
 sem medicao de upload. As seis amostras iniciais formam a linha de base; depois, uma
@@ -54,10 +63,16 @@ sobem gradualmente na fila de exclusao. Categorias vindas do autobrr devem ter r
 e ratio coerentes com cada tracker; as tags `keep` e `never-delete` continuam sendo uma
 protecao absoluta.
 
-O timer horario e suficiente porque o contador acumulado captura todo o upload entre
-execucoes, inclusive picos curtos. O limite de 15 itens e 400 GiB por rodada reduz
-rajadas de exclusoes nos HDDs. RAID0 nao oferece redundancia: a falha de um disco pode
-comprometer todo o volume, independentemente deste script.
+Somente na emergencia, `EMERGENCY_WITHOUT_HISTORY=true` permite considerar um item sem
+as seis horas de aprendizado. Isso nao ignora categoria, retencao, ratio, inatividade,
+tags, estado incompleto nem transferencia ativa: apenas dispensa o historico de upload
+para evitar disco cheio.
+
+O timer verifica a politica a cada 30 minutos. A consulta e leve e o contador acumulado
+captura o upload entre execucoes, inclusive picos curtos. Os limites de 20 itens/500 GiB
+no modo normal ou agressivo e 30 itens/800 GiB na emergencia controlam as rajadas de
+exclusao nos HDDs. RAID0 nao oferece redundancia: a falha de um disco pode comprometer
+todo o volume, independentemente deste script.
 
 ## Politica
 
@@ -110,9 +125,15 @@ Isso preserva o retorno por espaco: entre um torrent de 100 GiB quase parado e u
 sendo uma protecao absoluta no instante da verificacao.
 
 No modo normal, apenas candidatos com `NORMAL_MIN_SCORE` sao removidos. Sob pressao
-de disco, o limite passa a `AGGRESSIVE_MIN_SCORE` e os itens de maior pontuacao sao
-selecionados ate o espaco estimado atingir o alvo, o limite de itens ou o limite de
-GiB por execucao.
+de disco, o limite passa a `AGGRESSIVE_MIN_SCORE`. Abaixo do limite critico entra o
+modo de emergencia, com lote proprio e permissao configuravel para candidatos sem
+historico. Em todos os modos, os itens de maior pontuacao sao selecionados ate o espaco
+estimado atingir o alvo, o limite de itens ou o limite de GiB por execucao.
+
+O historico e gravado de forma atomica, e o resumo usado por `qbit-del log` e produzido
+como telemetria auxiliar. Uma falha apenas nesses dados gera aviso, mas nao cancela uma
+exclusao ja planejada. Isso evita que falta de espaco ou um resumo muito grande bloqueiem
+justamente a rotina responsavel por recuperar capacidade.
 
 > O espaco recuperado e uma estimativa. Hardlinks, snapshots, arquivos compartilhados
 > e a exclusao assincrona pelo qBittorrent podem fazer o valor real ser diferente.
@@ -132,7 +153,8 @@ Ele solicita `sudo` somente quando precisa alterar o sistema e pergunta:
 - usuario Linux que executara o servico;
 - endereco, porta, usuario e senha da Web UI do qBittorrent;
 - ponto de montagem que armazena os torrents;
-- gatilho e alvo de espaco livre em percentual;
+- limites critico, agressivo e alvo de espaco livre em percentual;
+- aplicacao opcional do perfil recomendado para racing de alta entrada;
 - categorias, retencao minima e ratio minimo em uma tabela editavel.
 
 Na pergunta do endereco, pressionar Enter usa `http://127.0.0.1`; a porta e solicitada
@@ -170,6 +192,11 @@ As mesmas acoes podem ser abertas diretamente:
 ./install.sh uninstall
 ```
 
+Em uma instalacao anterior, primeiro use `update` para trocar os executaveis e o timer
+sem alterar o `.env`. Depois use `reconfigure` para adicionar os tres limites; aceite o
+perfil de racing quando quiser aplicar os scores, lotes e intervalo de amostragem
+recomendados por esta versao.
+
 ## Comando global `qbit-del`
 
 O instalador adiciona `qbit-del` ao PATH do sistema. Ele pode ser chamado de qualquer
@@ -194,6 +221,7 @@ inativo depois de concluir; o painel diferencia esse estado de uma falha.
 - data, hora, modo real ou `DRY_RUN` e resultado;
 - confirmacao da conexao com o qBittorrent;
 - quantidade, volume, atividade e upload dos torrents gerenciados;
+- espaco livre, limites critico/agressivo/alvo e volume que falta recuperar;
 - historico pronto, elegiveis, selecionados e faixa de pontuacao;
 - ate oito categorias ordenadas por espaco, com score medio e maximo;
 - os cinco maiores scores, com eficiencia, inatividade, ratio e swarm;
@@ -280,13 +308,13 @@ obrigatorio: o script ja tenta autenticar novamente quando o cliente ainda esta 
 
 ### Impacto em HDD
 
-Uma verificacao por hora e leve: ha uma consulta de metadados na API e uma leitura de
-`df`, sem varrer o conteudo dos arquivos. A exclusao em si pode gerar rajadas de I/O de
-metadados quando ha muitos arquivos/diretorios. Os controles relevantes sao:
+Uma verificacao a cada 30 minutos e leve: ha uma consulta de metadados na API e uma
+leitura de `df`, sem varrer o conteudo dos arquivos. A exclusao em si pode gerar rajadas
+de I/O de metadados quando ha muitos arquivos/diretorios. Os controles relevantes sao:
 
 - `MAX_DELETE_PER_RUN` limita a quantidade;
 - `MAX_RECLAIM_GB_PER_RUN` limita o volume estimado selecionado;
-- `RandomizedDelaySec` evita concentrar a tarefa exatamente na virada da hora;
+- `RandomizedDelaySec` evita concentrar a tarefa exatamente na virada do relogio;
 - o modo normal com score alto evita apagar em todo ciclo sem necessidade.
 
 O `Nice=10` reduz a prioridade do script, mas a remocao dos arquivos ocorre no processo
