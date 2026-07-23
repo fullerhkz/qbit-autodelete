@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SERVICE_NAME="${QBIT_DEL_SERVICE:-qbit-autodelete.service}"
 TIMER_NAME="${QBIT_DEL_TIMER:-qbit-autodelete.timer}"
 SYSTEMCTL="${QBIT_DEL_SYSTEMCTL:-systemctl}"
@@ -108,6 +108,7 @@ human_rate() {
 show_policy_snapshot() {
   local policy="$1" managed total unmanaged size active upload ready eligible selected
   local score_average score_minimum score_maximum policy_mode category_count omitted
+  local disk_free disk_critical disk_low disk_high bytes_needed
   if [[ "$(jq 'length' <<<"${policy}")" -eq 0 ]]; then
     printf '\n%s%sPONTUACAO NA ULTIMA AVALIACAO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
     line
@@ -138,6 +139,17 @@ show_policy_snapshot() {
   printf '  %-25s %s | selecionados %s\n' "Elegiveis:" "${eligible}" "${selected}"
   printf '  %-25s media %s | min %s | max %s\n' "Scores:" "${score_average}" "${score_minimum}" "${score_maximum}"
   printf '  %-25s %s\n' "Modo da politica:" "${policy_mode}"
+  if [[ "$(jq -r '.disk_pressure_enabled // false' <<<"${policy}")" == "true" ]]; then
+    disk_free="$(jq -r '.disk_free_bytes // 0' <<<"${policy}")"
+    disk_critical="$(jq -r '.critical_watermark_bytes // 0' <<<"${policy}")"
+    disk_low="$(jq -r '.low_watermark_bytes // 0' <<<"${policy}")"
+    disk_high="$(jq -r '.high_watermark_bytes // 0' <<<"${policy}")"
+    bytes_needed="$(jq -r '.bytes_needed // 0' <<<"${policy}")"
+    printf '  %-25s %s\n' "Espaco livre:" "$(human_bytes "${disk_free}")"
+    printf '  %-25s %s / %s / %s\n' "Emerg./agress./alvo:" \
+      "$(human_bytes "${disk_critical}")" "$(human_bytes "${disk_low}")" "$(human_bytes "${disk_high}")"
+    printf '  %-25s %s\n' "A recuperar nesta faixa:" "$(human_bytes "${bytes_needed}")"
+  fi
 
   printf '\n%s%sCATEGORIAS POR ESPACO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
   line

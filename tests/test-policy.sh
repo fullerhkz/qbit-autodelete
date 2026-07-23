@@ -13,11 +13,14 @@ parse_args --config "${TEST_ROOT}/tests/fixtures/test.env"
 load_config
 validate_config
 
-assert_eq "${NORMAL_MIN_SCORE}" "70" "perfil racing: score normal"
-assert_eq "${AGGRESSIVE_MIN_SCORE}" "35" "perfil racing: score agressivo"
+assert_eq "${NORMAL_MIN_SCORE}" "65" "perfil racing: score normal"
+assert_eq "${AGGRESSIVE_MIN_SCORE}" "30" "perfil racing: score agressivo"
 assert_eq "${AGGRESSIVE_WITHOUT_HISTORY}" "false" "perfil racing: exige historico"
-assert_eq "${MAX_DELETE_PER_RUN}" "15" "perfil racing: limite de itens"
-assert_eq "${MAX_RECLAIM_GB_PER_RUN}" "400" "perfil racing: limite estimado por rodada"
+assert_eq "${MAX_DELETE_PER_RUN}" "20" "perfil racing: limite de itens"
+assert_eq "${MAX_RECLAIM_GB_PER_RUN}" "500" "perfil racing: limite estimado por rodada"
+assert_eq "${EMERGENCY_WITHOUT_HISTORY}" "true" "emergencia aceita sem historico"
+assert_eq "${EMERGENCY_MAX_DELETE_PER_RUN}" "30" "limite de itens na emergencia"
+assert_eq "${EMERGENCY_MAX_RECLAIM_GB_PER_RUN}" "800" "limite estimado na emergencia"
 
 now=2000000000
 rules='{"Categoria Filmes":{"retention_hours":48,"min_ratio":1.0}}'
@@ -93,15 +96,64 @@ selected="$(select_candidates "${scored}")"
 assert_eq "$(jq -r 'length' <<<"${selected}")" "1" "selecao normal"
 assert_eq "$(jq -r '.[0].hash' <<<"${selected}")" "large" "preserva maior retorno por GiB"
 
+without_history="$(jq -c '[.[] | select(.hash=="large") | .history_ready=false | .cleanup_score=0]' <<<"${scored}")"
+RUN_MODE="aggressive"
+BYTES_NEEDED=0
+selected="$(select_candidates "${without_history}")"
+assert_eq "$(jq -r 'length' <<<"${selected}")" "0" "agressivo ainda protege sem historico"
+RUN_MODE="emergency"
+BYTES_NEEDED=1073741824
+selected="$(select_candidates "${without_history}")"
+assert_eq "$(jq -r 'length' <<<"${selected}")" "1" "emergencia evita disco cheio sem historico"
+
 # Com 100% como piso, qualquer filesystem real entra em pressao.
 DISK_PRESSURE_ENABLED="true"
 STORAGE_PATH="/tmp"
 LOW_WATERMARK_GB=0
 HIGH_WATERMARK_GB=0
+CRITICAL_WATERMARK_GB=0
 LOW_WATERMARK_PERCENT=100
 HIGH_WATERMARK_PERCENT=100
+CRITICAL_WATERMARK_PERCENT=0
 choose_mode
 assert_eq "${RUN_MODE}" "aggressive" "gatilho de pressao por percentual"
 ((BYTES_NEEDED > 0)) || fail "modo agressivo deve calcular bytes a recuperar"
+
+CRITICAL_WATERMARK_PERCENT=100
+choose_mode
+assert_eq "${RUN_MODE}" "emergency" "gatilho critico por percentual"
+
+# Regressao: centenas de torrents excediam o limite por argumento do Linux quando
+# o JSON completo era passado a jq com --argjson. O resumo deve usar stdin.
+padding="$(printf '%0800d' 0)"
+large_snapshot="$(jq -cn --arg padding "${padding}" '[
+  range(0; 400) as $i | {
+    hash: ("hash-" + ($i|tostring)),
+    name: ($padding + ($i|tostring)),
+    category: "Carga",
+    size_bytes: 1073741824,
+    upspeed: 0,
+    cleanup_score: 50,
+    upload_efficiency_mib_per_gib_day: 0,
+    inactive_hours: 24,
+    ratio: 1,
+    swarm_seeds: 1,
+    swarm_leechers: 0,
+    history_ready: true,
+    eligible: true,
+    is_active_transfer: false
+  }
+]')"
+RUN_ID="policy-regression"
+RUN_MODE="normal"
+snapshot_output="$(emit_policy_snapshot "${large_snapshot}" '[]' 500)"
+grep -Fq '"managed_torrents":400' <<<"${snapshot_output}" ||
+  fail "resumo grande nao foi produzido via stdin"
+grep -Fq '"disk_pressure_enabled":true' <<<"${snapshot_output}" ||
+  fail "estado do disco ausente no resumo"
+
+snapshot_output="$(emit_policy_snapshot '{json-invalido' '[]' 1)"
+grep -Fq 'a limpeza continuara' <<<"${snapshot_output}" ||
+  fail "falha de observabilidade bloqueou a politica"
 
 printf 'OK: retorno de upload, historico, ratio e protecoes validados\n'

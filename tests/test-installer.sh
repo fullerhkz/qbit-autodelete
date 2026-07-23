@@ -34,8 +34,10 @@ QBT_PASS_VALUE='senha com espaco $aspas" e ; ponto'
 DRY_RUN_VALUE="true"
 DISK_PRESSURE_VALUE="true"
 STORAGE_PATH_VALUE="${TEMP_ROOT}/storage"
-LOW_PERCENT="10"
-HIGH_PERCENT="15"
+CRITICAL_PERCENT="10"
+LOW_PERCENT="20"
+HIGH_PERCENT="30"
+APPLY_RACING_PROFILE="true"
 CATEGORIES=("Filmes 4K|48|1.0" "Series|72|2.5")
 
 prepare_config "${TEMP_ROOT}/new.env" false
@@ -54,6 +56,10 @@ cp "${SOURCE_TIMER}" "${TEMP_ROOT}/systemd/qbit-autodelete.timer"
   assert_eq "${STATE_FILE}" "${STATE_DIR}/state.json" "arquivo de estado"
   assert_eq "${LOCK_FILE}" "${STATE_DIR}/run.lock" "arquivo de lock"
   assert_eq "${STORAGE_PATH}" "${STORAGE_PATH_VALUE}" "volume"
+  assert_eq "${CRITICAL_WATERMARK_PERCENT}" "10" "gatilho de emergencia"
+  assert_eq "${LOW_WATERMARK_PERCENT}" "20" "gatilho agressivo"
+  assert_eq "${HIGH_WATERMARK_PERCENT}" "30" "alvo de espaco"
+  assert_eq "${EMERGENCY_WITHOUT_HISTORY}" "true" "perfil de emergencia"
 )
 
 assert_contains "${TEMP_ROOT}/new.categories" "Filmes 4K|48|1.0"
@@ -93,7 +99,11 @@ assert_eq "${PARSED_QBT_HOST}" "https://qbt.example.invalid" "host extraido"
 assert_eq "${PARSED_QBT_PORT}" "9443" "porta extraida"
 split_qbt_url "https://qbt.example.invalid"
 assert_eq "${PARSED_QBT_PORT}" "443" "porta HTTPS implicita"
-LOW_PERCENT=10 HIGH_PERCENT=15 validate_percent_pair || fail "percentuais validos rejeitados"
-! (LOW_PERCENT=20 HIGH_PERCENT=10 validate_percent_pair) || fail "alvo menor que gatilho foi aceito"
+CRITICAL_PERCENT=10 LOW_PERCENT=20 HIGH_PERCENT=30 validate_percent_triplet ||
+  fail "percentuais validos rejeitados"
+! (CRITICAL_PERCENT=25 LOW_PERCENT=20 HIGH_PERCENT=30 validate_percent_triplet) ||
+  fail "emergencia maior que gatilho foi aceita"
+! (CRITICAL_PERCENT=10 LOW_PERCENT=30 HIGH_PERCENT=20 validate_percent_triplet) ||
+  fail "alvo menor que gatilho foi aceito"
 
 printf 'OK: geracao segura, categorias, unit e reconfiguracao validadas\n'

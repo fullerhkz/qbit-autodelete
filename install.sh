@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.2.0"
+INSTALLER_VERSION="1.3.0"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SOURCE_SCRIPT="${PROJECT_DIR}/qbit-autodelete.sh"
@@ -204,9 +204,11 @@ validate_decimal() {
   [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
 }
 
-validate_percent_pair() {
-  validate_uint "${LOW_PERCENT}" && validate_uint "${HIGH_PERCENT}" &&
-    ((LOW_PERCENT > 0 && LOW_PERCENT <= 100 && HIGH_PERCENT >= LOW_PERCENT && HIGH_PERCENT <= 100))
+validate_percent_triplet() {
+  validate_uint "${CRITICAL_PERCENT}" && validate_uint "${LOW_PERCENT}" &&
+    validate_uint "${HIGH_PERCENT}" &&
+    ((CRITICAL_PERCENT > 0 && CRITICAL_PERCENT <= LOW_PERCENT &&
+      LOW_PERCENT <= HIGH_PERCENT && HIGH_PERCENT <= 100))
 }
 
 missing_runtime_commands() {
@@ -387,7 +389,7 @@ categories_menu() {
 
 collect_configuration() {
   local existing="$1" default_user default_host default_port default_url default_qbt_user default_password
-  local default_storage default_low default_high default_pressure default_dry category_source
+  local default_storage default_critical default_low default_high default_pressure default_dry category_source
 
   default_user="$(default_service_user)"
   default_host="http://127.0.0.1"
@@ -395,8 +397,9 @@ collect_configuration() {
   default_qbt_user=""
   default_password=""
   default_storage=""
-  default_low="10"
-  default_high="15"
+  default_critical="10"
+  default_low="20"
+  default_high="30"
   default_pressure="true"
   default_dry="true"
   category_source="${CATEGORIES_FILE}"
@@ -409,12 +412,16 @@ collect_configuration() {
     default_qbt_user="$(safe_config_value QBT_USER)"
     default_password="$(safe_config_value QBT_PASS)"
     default_storage="$(safe_config_value STORAGE_PATH)"
+    default_critical="$(safe_config_value CRITICAL_WATERMARK_PERCENT)"
     default_low="$(safe_config_value LOW_WATERMARK_PERCENT)"
     default_high="$(safe_config_value HIGH_WATERMARK_PERCENT)"
     default_pressure="$(safe_config_value DISK_PRESSURE_ENABLED)"
     default_dry="$(safe_config_value DRY_RUN)"
     category_source="$(safe_config_value CATEGORY_RULES_FILE)"
     [[ -r "${category_source}" ]] || category_source="${CATEGORIES_FILE}"
+    if [[ -z "${default_critical}" ]]; then
+      default_critical="5"
+    fi
   fi
 
   printf '%s%s1. Servico e conexao%s\n' "${CYAN}" "${BOLD}" "${RESET}"
@@ -448,8 +455,9 @@ collect_configuration() {
   DISK_PRESSURE_VALUE="${REPLY_BOOL}"
 
   STORAGE_PATH_VALUE="${default_storage}"
-  LOW_PERCENT="${default_low:-10}"
-  HIGH_PERCENT="${default_high:-15}"
+  CRITICAL_PERCENT="${default_critical:-10}"
+  LOW_PERCENT="${default_low:-20}"
+  HIGH_PERCENT="${default_high:-30}"
   if [[ "${DISK_PRESSURE_VALUE}" == "true" ]]; then
     while true; do
       prompt STORAGE_PATH_VALUE "Ponto de montagem que armazena os torrents" "${default_storage}" true
@@ -457,11 +465,18 @@ collect_configuration() {
       warn "Informe um diretorio absoluto que ja exista."
     done
     while true; do
-      prompt LOW_PERCENT "Percentual livre que ativa o modo agressivo" "${default_low:-10}" true
-      prompt HIGH_PERCENT "Percentual livre que encerra o modo agressivo" "${default_high:-15}" true
-      validate_percent_pair && break
-      warn "Use 1-100 e mantenha o alvo final maior ou igual ao gatilho."
+      prompt CRITICAL_PERCENT "Percentual livre que ativa a emergencia" "${default_critical:-10}" true
+      prompt LOW_PERCENT "Percentual livre que ativa o modo agressivo" "${default_low:-20}" true
+      prompt HIGH_PERCENT "Percentual livre que encerra a pressao" "${default_high:-30}" true
+      validate_percent_triplet && break
+      warn "Use 1-100 e mantenha: emergencia <= agressivo <= alvo final."
     done
+  fi
+
+  APPLY_RACING_PROFILE="true"
+  if [[ "${existing}" == "true" ]]; then
+    ask_yes_no "Aplicar o perfil recomendado para racing de alta entrada?" no
+    APPLY_RACING_PROFILE="${REPLY_BOOL}"
   fi
 
   if [[ "${existing}" == "true" ]]; then
@@ -490,8 +505,10 @@ show_summary() {
   printf '%-25s %s\n' "Pressao de disco:" "${DISK_PRESSURE_VALUE}"
   if [[ "${DISK_PRESSURE_VALUE}" == "true" ]]; then
     printf '%-25s %s\n' "Armazenamento:" "${STORAGE_PATH_VALUE}"
-    printf '%-25s %s%% -> %s%%\n' "Limites livres:" "${LOW_PERCENT}" "${HIGH_PERCENT}"
+    printf '%-25s %s%% / %s%% / %s%%\n' \
+      "Emerg./agress./alvo:" "${CRITICAL_PERCENT}" "${LOW_PERCENT}" "${HIGH_PERCENT}"
   fi
+  printf '%-25s %s\n' "Perfil racing:" "${APPLY_RACING_PROFILE}"
   printf '%-25s %s\n' "DRY_RUN:" "${DRY_RUN_VALUE}"
   printf '%-25s %s\n' "Categorias:" "${#CATEGORIES[@]}"
   printf '%-25s %s\n' "Executavel:" "${INSTALL_SCRIPT}"
@@ -539,8 +556,21 @@ prepare_config() {
   replace_assignment "${destination}" LOCK_FILE "${STATE_DIR}/run.lock"
   replace_assignment "${destination}" DISK_PRESSURE_ENABLED "${DISK_PRESSURE_VALUE}"
   replace_assignment "${destination}" STORAGE_PATH "${STORAGE_PATH_VALUE}"
+  replace_assignment "${destination}" CRITICAL_WATERMARK_PERCENT "${CRITICAL_PERCENT}"
   replace_assignment "${destination}" LOW_WATERMARK_PERCENT "${LOW_PERCENT}"
   replace_assignment "${destination}" HIGH_WATERMARK_PERCENT "${HIGH_PERCENT}"
+  if [[ "${APPLY_RACING_PROFILE:-false}" == "true" ]]; then
+    replace_assignment "${destination}" NORMAL_MIN_SCORE "65"
+    replace_assignment "${destination}" AGGRESSIVE_MIN_SCORE "30"
+    replace_assignment "${destination}" AGGRESSIVE_WITHOUT_HISTORY "false"
+    replace_assignment "${destination}" MAX_DELETE_PER_RUN "20"
+    replace_assignment "${destination}" MAX_RECLAIM_GB_PER_RUN "500"
+    replace_assignment "${destination}" EMERGENCY_MIN_SCORE "0"
+    replace_assignment "${destination}" EMERGENCY_WITHOUT_HISTORY "true"
+    replace_assignment "${destination}" EMERGENCY_MAX_DELETE_PER_RUN "30"
+    replace_assignment "${destination}" EMERGENCY_MAX_RECLAIM_GB_PER_RUN "800"
+    replace_assignment "${destination}" HISTORY_MIN_SAMPLE_SECONDS "1500"
+  fi
 }
 
 prepare_categories() {

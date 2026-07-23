@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.2.0"
+VERSION="3.3.0"
 
 declare -A RETENTION_HOURS=()
 declare -A MIN_RATIOS=()
@@ -99,11 +99,15 @@ load_config() {
   MIN_INACTIVE_HOURS="${MIN_INACTIVE_HOURS:-6}"
 
   NORMAL_CLEANUP_ENABLED="${NORMAL_CLEANUP_ENABLED:-true}"
-  NORMAL_MIN_SCORE="${NORMAL_MIN_SCORE:-70}"
-  AGGRESSIVE_MIN_SCORE="${AGGRESSIVE_MIN_SCORE:-35}"
+  NORMAL_MIN_SCORE="${NORMAL_MIN_SCORE:-65}"
+  AGGRESSIVE_MIN_SCORE="${AGGRESSIVE_MIN_SCORE:-30}"
   AGGRESSIVE_WITHOUT_HISTORY="${AGGRESSIVE_WITHOUT_HISTORY:-false}"
-  MAX_DELETE_PER_RUN="${MAX_DELETE_PER_RUN:-15}"
-  MAX_RECLAIM_GB_PER_RUN="${MAX_RECLAIM_GB_PER_RUN:-400}"
+  MAX_DELETE_PER_RUN="${MAX_DELETE_PER_RUN:-20}"
+  MAX_RECLAIM_GB_PER_RUN="${MAX_RECLAIM_GB_PER_RUN:-500}"
+  EMERGENCY_MIN_SCORE="${EMERGENCY_MIN_SCORE:-0}"
+  EMERGENCY_WITHOUT_HISTORY="${EMERGENCY_WITHOUT_HISTORY:-true}"
+  EMERGENCY_MAX_DELETE_PER_RUN="${EMERGENCY_MAX_DELETE_PER_RUN:-30}"
+  EMERGENCY_MAX_RECLAIM_GB_PER_RUN="${EMERGENCY_MAX_RECLAIM_GB_PER_RUN:-800}"
 
   SCORE_LOW_UPLOAD_WEIGHT="${SCORE_LOW_UPLOAD_WEIGHT:-45}"
   SCORE_SIZE_WEIGHT="${SCORE_SIZE_WEIGHT:-20}"
@@ -123,8 +127,12 @@ load_config() {
   STORAGE_PATH="${STORAGE_PATH:-}"
   LOW_WATERMARK_GB="${LOW_WATERMARK_GB:-0}"
   HIGH_WATERMARK_GB="${HIGH_WATERMARK_GB:-0}"
+  CRITICAL_WATERMARK_GB="${CRITICAL_WATERMARK_GB:-0}"
   LOW_WATERMARK_PERCENT="${LOW_WATERMARK_PERCENT:-0}"
   HIGH_WATERMARK_PERCENT="${HIGH_WATERMARK_PERCENT:-0}"
+  # Zero preserva compatibilidade com configuracoes anteriores. Instalacoes novas
+  # recebem um limite critico explicito pelo arquivo de exemplo/instalador.
+  CRITICAL_WATERMARK_PERCENT="${CRITICAL_WATERMARK_PERCENT:-0}"
 
   CURL_INSECURE="${CURL_INSECURE:-false}"
   CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-10}"
@@ -207,27 +215,33 @@ validate_config() {
   local bool_name
   for bool_name in DRY_RUN DELETE_FILES ALLOW_INCOMPLETE_DELETE INCLUDE_NO_CATEGORY \
     SKIP_FORCE_STARTED SKIP_ACTIVE_TRANSFERS NORMAL_CLEANUP_ENABLED AGGRESSIVE_WITHOUT_HISTORY \
+    EMERGENCY_WITHOUT_HISTORY \
     DISK_PRESSURE_ENABLED CURL_INSECURE; do
     validate_bool "${bool_name}"
   done
 
   local uint_name
   for uint_name in NO_CATEGORY_RETENTION_HOURS RATIO_PROTECTION_MAX_HOURS MIN_INACTIVE_HOURS MAX_DELETE_PER_RUN \
-    MAX_RECLAIM_GB_PER_RUN SCORE_LOW_UPLOAD_WEIGHT SCORE_SIZE_WEIGHT SCORE_INACTIVITY_WEIGHT \
+    MAX_RECLAIM_GB_PER_RUN EMERGENCY_MAX_DELETE_PER_RUN EMERGENCY_MAX_RECLAIM_GB_PER_RUN \
+    SCORE_LOW_UPLOAD_WEIGHT SCORE_SIZE_WEIGHT SCORE_INACTIVITY_WEIGHT \
     SCORE_COMPETITION_WEIGHT SIZE_FULL_SCORE_GB INACTIVITY_FULL_SCORE_HOURS HISTORY_MIN_SAMPLES \
-    HISTORY_MIN_HOURS HISTORY_MIN_SAMPLE_SECONDS LOW_WATERMARK_GB \
-    HIGH_WATERMARK_GB CONNECT_TIMEOUT REQUEST_TIMEOUT LOGIN_RETRIES; do
+    HISTORY_MIN_HOURS HISTORY_MIN_SAMPLE_SECONDS LOW_WATERMARK_GB HIGH_WATERMARK_GB \
+    CRITICAL_WATERMARK_GB CONNECT_TIMEOUT REQUEST_TIMEOUT LOGIN_RETRIES; do
     validate_uint "${uint_name}"
   done
   validate_range_0_100 NORMAL_MIN_SCORE
   validate_range_0_100 AGGRESSIVE_MIN_SCORE
+  validate_range_0_100 EMERGENCY_MIN_SCORE
   validate_range_0_100 LOW_WATERMARK_PERCENT
   validate_range_0_100 HIGH_WATERMARK_PERCENT
+  validate_range_0_100 CRITICAL_WATERMARK_PERCENT
   validate_range_0_100 UPLOAD_EWMA_ALPHA_PERCENT
   validate_decimal DEFAULT_MIN_RATIO
   validate_decimal UPLOAD_EFFICIENCY_FULL_MIB_PER_GIB_DAY
 
   ((MAX_DELETE_PER_RUN > 0)) || die "MAX_DELETE_PER_RUN deve ser maior que zero"
+  ((EMERGENCY_MAX_DELETE_PER_RUN > 0)) ||
+    die "EMERGENCY_MAX_DELETE_PER_RUN deve ser maior que zero"
   ((SIZE_FULL_SCORE_GB > 0 && INACTIVITY_FULL_SCORE_HOURS > 0)) ||
     die "os valores *_FULL_SCORE devem ser maiores que zero"
   awk -v value="${UPLOAD_EFFICIENCY_FULL_MIB_PER_GIB_DAY}" 'BEGIN {exit !(value > 0)}' ||
@@ -245,6 +259,10 @@ validate_config() {
       die "HIGH_WATERMARK_GB nao pode ser menor que LOW_WATERMARK_GB"
     ((HIGH_WATERMARK_PERCENT >= LOW_WATERMARK_PERCENT)) ||
       die "HIGH_WATERMARK_PERCENT nao pode ser menor que LOW_WATERMARK_PERCENT"
+    ((CRITICAL_WATERMARK_GB <= LOW_WATERMARK_GB)) ||
+      die "CRITICAL_WATERMARK_GB nao pode ser maior que LOW_WATERMARK_GB"
+    ((CRITICAL_WATERMARK_PERCENT <= LOW_WATERMARK_PERCENT)) ||
+      die "CRITICAL_WATERMARK_PERCENT nao pode ser maior que LOW_WATERMARK_PERCENT"
   fi
 
   load_category_rules
@@ -468,8 +486,14 @@ score_torrents() {
 save_state() {
   local scored_json="$1" now_epoch="$2" state_dir state_tmp
   state_dir="$(dirname "${STATE_FILE}")"
-  mkdir -p "${state_dir}" || die "nao foi possivel criar o diretorio de historico: ${state_dir}"
-  state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || die "nao foi possivel criar historico temporario"
+  if ! mkdir -p "${state_dir}"; then
+    log "AVISO" "nao foi possivel criar o diretorio de historico: ${state_dir}"
+    return 1
+  fi
+  if ! state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"; then
+    log "AVISO" "nao foi possivel criar o historico temporario; a limpeza continuara"
+    return 1
+  fi
 
   if ! jq -c --argjson now "${now_epoch}" '
     reduce .[] as $torrent
@@ -477,10 +501,14 @@ save_state() {
        .torrents[$torrent.hash] = $torrent.history_next)
   ' <<<"${scored_json}" >"${state_tmp}"; then
     rm -f "${state_tmp}"
-    die "falha ao montar o historico de upload"
+    log "AVISO" "falha ao montar o historico de upload; a limpeza continuara"
+    return 1
   fi
-  chmod 600 "${state_tmp}"
-  mv -f "${state_tmp}" "${STATE_FILE}" || die "nao foi possivel salvar o historico em ${STATE_FILE}"
+  if ! chmod 600 "${state_tmp}" || ! mv -f "${state_tmp}" "${STATE_FILE}"; then
+    rm -f "${state_tmp}"
+    log "AVISO" "nao foi possivel salvar o historico em ${STATE_FILE}; a limpeza continuara"
+    return 1
+  fi
 }
 
 filesystem_status() {
@@ -503,19 +531,28 @@ choose_mode() {
   DISK_FREE_BYTES=0
   LOW_WATERMARK_BYTES=0
   HIGH_WATERMARK_BYTES=0
+  CRITICAL_WATERMARK_BYTES=0
 
   [[ "${DISK_PRESSURE_ENABLED}" == "true" ]] || return 0
 
   read -r DISK_TOTAL_BYTES DISK_FREE_BYTES < <(filesystem_status)
   local low_gb_bytes=$((LOW_WATERMARK_GB * 1024 * 1024 * 1024))
   local high_gb_bytes=$((HIGH_WATERMARK_GB * 1024 * 1024 * 1024))
+  local critical_gb_bytes=$((CRITICAL_WATERMARK_GB * 1024 * 1024 * 1024))
   local low_percent_bytes=$((DISK_TOTAL_BYTES * LOW_WATERMARK_PERCENT / 100))
   local high_percent_bytes=$((DISK_TOTAL_BYTES * HIGH_WATERMARK_PERCENT / 100))
+  local critical_percent_bytes=$((DISK_TOTAL_BYTES * CRITICAL_WATERMARK_PERCENT / 100))
   LOW_WATERMARK_BYTES="$(max_number "${low_gb_bytes}" "${low_percent_bytes}")"
   HIGH_WATERMARK_BYTES="$(max_number "${high_gb_bytes}" "${high_percent_bytes}")"
+  CRITICAL_WATERMARK_BYTES="$(max_number "${critical_gb_bytes}" "${critical_percent_bytes}")"
 
-  if ((DISK_FREE_BYTES < LOW_WATERMARK_BYTES)); then
+  if ((CRITICAL_WATERMARK_BYTES > 0 && DISK_FREE_BYTES < CRITICAL_WATERMARK_BYTES)); then
+    RUN_MODE="emergency"
+  elif ((DISK_FREE_BYTES < LOW_WATERMARK_BYTES)); then
     RUN_MODE="aggressive"
+  fi
+
+  if [[ "${RUN_MODE}" != "normal" ]]; then
     BYTES_NEEDED=$((HIGH_WATERMARK_BYTES - DISK_FREE_BYTES))
     if ((BYTES_NEEDED < 0)); then
       BYTES_NEEDED=0
@@ -525,27 +562,43 @@ choose_mode() {
 
 select_candidates() {
   local scored_json="$1"
-  local threshold bytes_limit
-  if [[ "${RUN_MODE}" == "aggressive" ]]; then
-    threshold="${AGGRESSIVE_MIN_SCORE}"
-    bytes_limit="${BYTES_NEEDED}"
-  else
-    threshold="${NORMAL_MIN_SCORE}"
-    bytes_limit=0
-    [[ "${NORMAL_CLEANUP_ENABLED}" == "true" ]] || { printf '[]'; return 0; }
-  fi
+  local threshold bytes_limit without_history max_count max_reclaim_gb
+  case "${RUN_MODE}" in
+    emergency)
+      threshold="${EMERGENCY_MIN_SCORE}"
+      bytes_limit="${BYTES_NEEDED}"
+      without_history="${EMERGENCY_WITHOUT_HISTORY}"
+      max_count="${EMERGENCY_MAX_DELETE_PER_RUN}"
+      max_reclaim_gb="${EMERGENCY_MAX_RECLAIM_GB_PER_RUN}"
+      ;;
+    aggressive)
+      threshold="${AGGRESSIVE_MIN_SCORE}"
+      bytes_limit="${BYTES_NEEDED}"
+      without_history="${AGGRESSIVE_WITHOUT_HISTORY}"
+      max_count="${MAX_DELETE_PER_RUN}"
+      max_reclaim_gb="${MAX_RECLAIM_GB_PER_RUN}"
+      ;;
+    *)
+      threshold="${NORMAL_MIN_SCORE}"
+      bytes_limit=0
+      without_history="false"
+      max_count="${MAX_DELETE_PER_RUN}"
+      max_reclaim_gb="${MAX_RECLAIM_GB_PER_RUN}"
+      [[ "${NORMAL_CLEANUP_ENABLED}" == "true" ]] || { printf '[]'; return 0; }
+      ;;
+  esac
 
-  local max_reclaim_bytes=$((MAX_RECLAIM_GB_PER_RUN * 1024 * 1024 * 1024))
+  local max_reclaim_bytes=$((max_reclaim_gb * 1024 * 1024 * 1024))
   jq -c \
     --argjson threshold "${threshold}" \
     --arg mode "${RUN_MODE}" \
-    --argjson aggressive_without_history "${AGGRESSIVE_WITHOUT_HISTORY}" \
-    --argjson max_count "${MAX_DELETE_PER_RUN}" \
+    --argjson without_history "${without_history}" \
+    --argjson max_count "${max_count}" \
     --argjson wanted_bytes "${bytes_limit}" \
     --argjson max_reclaim_bytes "${max_reclaim_bytes}" '
       [ .[]
         | select(.eligible)
-        | select(.history_ready or ($mode == "aggressive" and $aggressive_without_history))
+        | select(.history_ready or ($mode != "normal" and $without_history))
         | select(.cleanup_score >= $threshold)
       ]
       | sort_by(.cleanup_score, .size_bytes) | reverse
@@ -576,7 +629,7 @@ show_policy_summary() {
 
   log "INFO" "modo=${RUN_MODE}; gerenciados=${managed}/${total}; historico_pronto=${history_ready}; elegiveis=${eligible}; selecionados=${selected}; recuperacao_estimada=$(human_gib "${planned}")"
   if [[ "${DISK_PRESSURE_ENABLED}" == "true" ]]; then
-    log "INFO" "disco livre=$(human_gib "${DISK_FREE_BYTES}"); gatilho=$(human_gib "${LOW_WATERMARK_BYTES}"); alvo=$(human_gib "${HIGH_WATERMARK_BYTES}")"
+    log "INFO" "disco livre=$(human_gib "${DISK_FREE_BYTES}"); emergencia=$(human_gib "${CRITICAL_WATERMARK_BYTES}"); gatilho=$(human_gib "${LOW_WATERMARK_BYTES}"); alvo=$(human_gib "${HIGH_WATERMARK_BYTES}")"
   fi
 
   if ((selected > 0)); then
@@ -599,26 +652,43 @@ show_policy_summary() {
 
 emit_policy_snapshot() {
   local scored_json="$1" selected_json="$2" total="$3" selected_hashes snapshot
-  selected_hashes="$(jq -c '[.[].hash]' <<<"${selected_json}")"
-  snapshot="$(jq -cn \
+  if ! selected_hashes="$(jq -c '[.[].hash]' <<<"${selected_json}" 2>/dev/null)"; then
+    log "AVISO" "nao foi possivel preparar o resumo estruturado; a limpeza continuara"
+    return 0
+  fi
+  if ! snapshot="$(jq -c \
     --arg run_id "${RUN_ID}" \
     --arg timestamp "$(date --iso-8601=seconds)" \
     --arg mode "${RUN_MODE}" \
     --argjson total_torrents "${total}" \
-    --argjson torrents "${scored_json}" \
-    --argjson selected_hashes "${selected_hashes}" '
+    --argjson selected_hashes "${selected_hashes}" \
+    --argjson disk_pressure_enabled "${DISK_PRESSURE_ENABLED}" \
+    --argjson disk_total_bytes "${DISK_TOTAL_BYTES}" \
+    --argjson disk_free_bytes "${DISK_FREE_BYTES}" \
+    --argjson critical_watermark_bytes "${CRITICAL_WATERMARK_BYTES}" \
+    --argjson low_watermark_bytes "${LOW_WATERMARK_BYTES}" \
+    --argjson high_watermark_bytes "${HIGH_WATERMARK_BYTES}" \
+    --argjson bytes_needed "${BYTES_NEEDED}" '
       def selected($hash): ($selected_hashes | index($hash)) != null;
       def rounded_average($values):
         if ($values | length) > 0
         then (($values | add / length * 100) | round / 100)
         else 0 end;
-      ($torrents | length) as $managed
+      . as $torrents
+      | ($torrents | length) as $managed
       | ($torrents | map(.cleanup_score // 0)) as $scores
       | {
           event: "policy_snapshot",
           run_id: $run_id,
           timestamp: $timestamp,
           mode: $mode,
+          disk_pressure_enabled: $disk_pressure_enabled,
+          disk_total_bytes: $disk_total_bytes,
+          disk_free_bytes: $disk_free_bytes,
+          critical_watermark_bytes: $critical_watermark_bytes,
+          low_watermark_bytes: $low_watermark_bytes,
+          high_watermark_bytes: $high_watermark_bytes,
+          bytes_needed: $bytes_needed,
           total_torrents: $total_torrents,
           managed_torrents: $managed,
           unmanaged_torrents: ([$total_torrents - $managed, 0] | max),
@@ -678,7 +748,10 @@ emit_policy_snapshot() {
               })
           )
         }
-    ')" || die "falha ao montar o resumo estruturado da politica"
+    ' <<<"${scored_json}" 2>/dev/null)"; then
+    log "AVISO" "nao foi possivel montar o resumo estruturado; a limpeza continuara"
+    return 0
+  fi
   emit_event "${snapshot}"
 }
 
@@ -768,8 +841,9 @@ main() {
   choose_mode
   selected_json="$(select_candidates "${scored_json}")"
   show_policy_summary "${scored_json}" "${selected_json}" "$(jq 'length' <<<"${raw_json}")"
+  save_state "${scored_json}" "${now_epoch}" ||
+    log "AVISO" "historico nao atualizado nesta execucao"
   emit_policy_snapshot "${scored_json}" "${selected_json}" "$(jq 'length' <<<"${raw_json}")"
-  save_state "${scored_json}" "${now_epoch}"
   delete_torrents "${selected_json}"
   emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
     '{event:"run_completed", run_id:$run_id, timestamp:$timestamp, success:true}')"

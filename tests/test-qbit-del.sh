@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CALLS_FILE="$(mktemp -t qbit-del-calls.XXXXXX)"
-trap 'rm -f -- "${CALLS_FILE}"' EXIT
+DISK_JOURNAL="$(mktemp -t qbit-del-disk-journal.XXXXXX)"
+trap 'rm -f -- "${CALLS_FILE}" "${DISK_JOURNAL}"' EXIT
 
 fail() { printf 'FALHOU: %s\n' "$*" >&2; exit 1; }
 assert_output() { grep -Fq -- "$2" <<<"$1" || fail "'$2' ausente na saida"; }
@@ -36,6 +37,15 @@ assert_output "${log_output}" "Filme A"
 assert_output "${log_output}" "Torrents removidos:      3"
 assert_output "${log_output}" "Espaco estimado:         8.00 GiB"
 ! grep -Fq 'old-run' <<<"${log_output}" || fail "execucao antiga apareceu no resumo"
+
+sed 's/"mode":"normal"/"mode":"emergency","disk_pressure_enabled":true,"disk_free_bytes":107374182400,"critical_watermark_bytes":214748364800,"low_watermark_bytes":429496729600,"high_watermark_bytes":644245094400,"bytes_needed":536870912000/' \
+  "${TEST_ROOT}/tests/fixtures/qbit-del-journal.log" >"${DISK_JOURNAL}"
+disk_output="$(env "${COMMON_ENV[@]}" QBIT_DEL_JOURNAL_FILE="${DISK_JOURNAL}" \
+  "${TEST_ROOT}/qbit-del" log)"
+assert_output "${disk_output}" "Modo da politica:         emergency"
+assert_output "${disk_output}" "Espaco livre:             100.00 GiB"
+assert_output "${disk_output}" "Emerg./agress./alvo:      200.00 GiB / 400.00 GiB / 600.00 GiB"
+assert_output "${disk_output}" "A recuperar nesta faixa:  500.00 GiB"
 
 failure_output="$(env "${COMMON_ENV[@]}" \
   QBIT_DEL_JOURNAL_FILE="${TEST_ROOT}/tests/fixtures/qbit-del-failure.log" \
