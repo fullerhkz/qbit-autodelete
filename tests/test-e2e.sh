@@ -14,7 +14,7 @@ rm -f "${state_file}"
 cleanup_test() { kill "${server_pid}" 2>/dev/null || true; rm -f "${state_file}" "${port_file}" "${delete_file}"; }
 trap cleanup_test EXIT
 
-for _ in {1..20}; do
+for _ in {1..100}; do
   if [[ -s "${port_file}" ]]; then break; fi
   if kill -0 "${server_pid}" 2>/dev/null; then sleep 0.05; else exit 1; fi
 done
@@ -39,7 +39,7 @@ grep -q 'QBIT_EVENT.*"event":"deletion_summary".*"dry_run":true' <<<"${second_ou
 
 live_output="$("${TEST_ROOT}/qbit-autodelete.sh" --config "${TEST_ROOT}/tests/fixtures/e2e-live.env")"
 grep -q 'QBIT_EVENT.*"event":"torrent_deleted".*"category":"Categoria-Filmes"' <<<"${live_output}"
-grep -q 'QBIT_EVENT.*"event":"deletion_summary".*"deleted_count":1.*"released_bytes":53687091200' <<<"${live_output}"
+grep -q 'QBIT_EVENT.*"event":"deletion_summary".*"planned_bytes":53687091200.*"deleted_count":1.*"released_bytes":0.*"physical_measurement_available":false' <<<"${live_output}"
 grep -q 'QBIT_EVENT.*"event":"run_completed".*"success":true' <<<"${live_output}"
 [[ -s "${delete_file}" ]]
 

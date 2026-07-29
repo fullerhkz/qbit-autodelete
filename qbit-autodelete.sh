@@ -3,9 +3,10 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.3.0"
+VERSION="3.4.0"
 
 declare -A RETENTION_HOURS=()
+declare -A EMERGENCY_RETENTION_HOURS=()
 declare -A MIN_RATIOS=()
 COOKIE_JAR=""
 CLI_DRY_RUN=""
@@ -97,6 +98,8 @@ load_config() {
   SKIP_FORCE_STARTED="${SKIP_FORCE_STARTED:-true}"
   SKIP_ACTIVE_TRANSFERS="${SKIP_ACTIVE_TRANSFERS:-true}"
   MIN_INACTIVE_HOURS="${MIN_INACTIVE_HOURS:-6}"
+  AGGRESSIVE_MIN_INACTIVE_HOURS="${AGGRESSIVE_MIN_INACTIVE_HOURS:-2}"
+  EMERGENCY_MIN_INACTIVE_HOURS="${EMERGENCY_MIN_INACTIVE_HOURS:-0}"
 
   NORMAL_CLEANUP_ENABLED="${NORMAL_CLEANUP_ENABLED:-true}"
   NORMAL_MIN_SCORE="${NORMAL_MIN_SCORE:-65}"
@@ -138,6 +141,8 @@ load_config() {
   CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-10}"
   REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-60}"
   LOGIN_RETRIES="${LOGIN_RETRIES:-5}"
+  PHYSICAL_MEASURE_TIMEOUT_SECONDS="${PHYSICAL_MEASURE_TIMEOUT_SECONDS:-300}"
+  PHYSICAL_MEASURE_INTERVAL_SECONDS="${PHYSICAL_MEASURE_INTERVAL_SECONDS:-5}"
   LOCK_FILE="${LOCK_FILE:-/tmp/qbit-autodelete-${UID}.lock}"
 }
 
@@ -174,36 +179,41 @@ trim() {
 load_category_rules() {
   [[ -r "${CATEGORY_RULES_FILE}" ]] || die "arquivo de categorias nao legivel: ${CATEGORY_RULES_FILE}"
 
-  local raw category hours min_ratio extra line_number=0
+  local raw category hours min_ratio emergency_hours extra line_number=0
   while IFS= read -r raw || [[ -n "${raw}" ]]; do
     ((line_number += 1))
     raw="${raw%$'\r'}"
     [[ "${raw}" =~ ^[[:space:]]*(#|$) ]] && continue
 
-    IFS='|' read -r category hours min_ratio extra <<<"${raw}"
+    IFS='|' read -r category hours min_ratio emergency_hours extra <<<"${raw}"
     category="$(trim "${category:-}")"
     hours="$(trim "${hours:-}")"
     min_ratio="$(trim "${min_ratio:-${DEFAULT_MIN_RATIO}}")"
+    emergency_hours="$(trim "${emergency_hours:-${hours}}")"
     [[ -n "${min_ratio}" ]] || min_ratio="${DEFAULT_MIN_RATIO}"
+    [[ -n "${emergency_hours}" ]] || emergency_hours="${hours}"
     [[ -n "${category}" && -z "${extra:-}" && "${hours}" =~ ^[0-9]+$ &&
+      "${emergency_hours}" =~ ^[0-9]+$ && 10#${emergency_hours} -le 10#${hours} &&
       "${min_ratio}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
-      die "regra invalida em ${CATEGORY_RULES_FILE}:${line_number}; use Categoria|horas|min_ratio"
+      die "regra invalida em ${CATEGORY_RULES_FILE}:${line_number}; use Categoria|horas|min_ratio|horas_emergencia (horas_emergencia <= horas)"
     [[ -z "${RETENTION_HOURS[${category}]+x}" ]] ||
       die "categoria duplicada em ${CATEGORY_RULES_FILE}:${line_number}: ${category}"
     RETENTION_HOURS["${category}"]="${hours}"
+    EMERGENCY_RETENTION_HOURS["${category}"]="${emergency_hours}"
     MIN_RATIOS["${category}"]="${min_ratio}"
   done < "${CATEGORY_RULES_FILE}"
 
   ((${#RETENTION_HOURS[@]} > 0)) || die "nenhuma categoria configurada em ${CATEGORY_RULES_FILE}"
   if [[ "${INCLUDE_NO_CATEGORY}" == "true" ]]; then
     RETENTION_HOURS[""]="${NO_CATEGORY_RETENTION_HOURS}"
+    EMERGENCY_RETENTION_HOURS[""]="${NO_CATEGORY_RETENTION_HOURS}"
     MIN_RATIOS[""]="${DEFAULT_MIN_RATIO}"
   fi
 }
 
 validate_config() {
   local cmd
-  for cmd in curl jq date df awk flock mktemp dirname mkdir mv chmod rm; do
+  for cmd in curl jq date df awk flock mktemp dirname mkdir mv chmod rm find stat base64; do
     command -v "${cmd}" >/dev/null 2>&1 || die "dependencia ausente: ${cmd}"
   done
 
@@ -221,7 +231,8 @@ validate_config() {
   done
 
   local uint_name
-  for uint_name in NO_CATEGORY_RETENTION_HOURS RATIO_PROTECTION_MAX_HOURS MIN_INACTIVE_HOURS MAX_DELETE_PER_RUN \
+  for uint_name in NO_CATEGORY_RETENTION_HOURS RATIO_PROTECTION_MAX_HOURS MIN_INACTIVE_HOURS \
+    AGGRESSIVE_MIN_INACTIVE_HOURS EMERGENCY_MIN_INACTIVE_HOURS MAX_DELETE_PER_RUN \
     MAX_RECLAIM_GB_PER_RUN EMERGENCY_MAX_DELETE_PER_RUN EMERGENCY_MAX_RECLAIM_GB_PER_RUN \
     SCORE_LOW_UPLOAD_WEIGHT SCORE_SIZE_WEIGHT SCORE_INACTIVITY_WEIGHT \
     SCORE_COMPETITION_WEIGHT SIZE_FULL_SCORE_GB INACTIVITY_FULL_SCORE_HOURS HISTORY_MIN_SAMPLES \
@@ -229,6 +240,8 @@ validate_config() {
     CRITICAL_WATERMARK_GB CONNECT_TIMEOUT REQUEST_TIMEOUT LOGIN_RETRIES; do
     validate_uint "${uint_name}"
   done
+  validate_uint PHYSICAL_MEASURE_TIMEOUT_SECONDS
+  validate_uint PHYSICAL_MEASURE_INTERVAL_SECONDS
   validate_range_0_100 NORMAL_MIN_SCORE
   validate_range_0_100 AGGRESSIVE_MIN_SCORE
   validate_range_0_100 EMERGENCY_MIN_SCORE
@@ -242,6 +255,8 @@ validate_config() {
   ((MAX_DELETE_PER_RUN > 0)) || die "MAX_DELETE_PER_RUN deve ser maior que zero"
   ((EMERGENCY_MAX_DELETE_PER_RUN > 0)) ||
     die "EMERGENCY_MAX_DELETE_PER_RUN deve ser maior que zero"
+  ((PHYSICAL_MEASURE_INTERVAL_SECONDS > 0)) ||
+    die "PHYSICAL_MEASURE_INTERVAL_SECONDS deve ser maior que zero"
   ((SIZE_FULL_SCORE_GB > 0 && INACTIVITY_FULL_SCORE_HOURS > 0)) ||
     die "os valores *_FULL_SCORE devem ser maiores que zero"
   awk -v value="${UPLOAD_EFFICIENCY_FULL_MIB_PER_GIB_DAY}" 'BEGIN {exit !(value > 0)}' ||
@@ -272,8 +287,14 @@ rules_as_json() {
   local json='{}' category
   for category in "${!RETENTION_HOURS[@]}"; do
     json="$(jq -cn --argjson current "${json}" --arg category "${category}" \
-      --argjson hours "${RETENTION_HOURS[${category}]}" --argjson min_ratio "${MIN_RATIOS[${category}]}" \
-      '$current + {($category): {retention_hours: $hours, min_ratio: $min_ratio}}')"
+      --argjson hours "${RETENTION_HOURS[${category}]}" \
+      --argjson emergency_hours "${EMERGENCY_RETENTION_HOURS[${category}]}" \
+      --argjson min_ratio "${MIN_RATIOS[${category}]}" \
+      '$current + {($category): {
+        retention_hours: $hours,
+        emergency_retention_hours: $emergency_hours,
+        min_ratio: $min_ratio
+      }}')"
   done
   printf '%s' "${json}"
 }
@@ -362,11 +383,14 @@ score_torrents() {
     --argjson now "${now_epoch}" \
     --argjson rules "${rules_json}" \
     --argjson history "${state_json}" \
+    --arg mode "${RUN_MODE:-normal}" \
     --arg protected_tags "${PROTECTED_TAGS}" \
     --argjson allow_incomplete "${ALLOW_INCOMPLETE_DELETE}" \
     --argjson skip_forced "${SKIP_FORCE_STARTED}" \
     --argjson skip_active "${SKIP_ACTIVE_TRANSFERS}" \
-    --argjson min_inactive "${MIN_INACTIVE_HOURS}" \
+    --argjson normal_min_inactive "${MIN_INACTIVE_HOURS}" \
+    --argjson aggressive_min_inactive "${AGGRESSIVE_MIN_INACTIVE_HOURS}" \
+    --argjson emergency_min_inactive "${EMERGENCY_MIN_INACTIVE_HOURS}" \
     --argjson ratio_protection_max_hours "${RATIO_PROTECTION_MAX_HOURS}" \
     --argjson history_min_samples "${HISTORY_MIN_SAMPLES}" \
     --argjson history_min_hours "${HISTORY_MIN_HOURS}" \
@@ -384,12 +408,18 @@ score_torrents() {
       def clean_tags:
         ((.tags // "") | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)));
       ($ewma_alpha_percent / 100) as $alpha
+      | (if $mode == "emergency" then $emergency_min_inactive
+         elif $mode == "aggressive" then $aggressive_min_inactive
+         else $normal_min_inactive end) as $effective_min_inactive
       |
       ($protected_tags | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))) as $protected
       | map(
           (.category // "") as $category
           | select($rules[$category] != null)
           | $rules[$category] as $rule
+          | (if $mode == "emergency"
+             then ($rule.emergency_retention_hours // $rule.retention_hours)
+             else $rule.retention_hours end) as $effective_retention
           | ($history.torrents[.hash] // null) as $previous
           | ([($now - ($previous.sampled_at // $now)), 0] | max) as $sample_elapsed
           | ([.uploaded // 0, 0] | max) as $uploaded_now
@@ -439,13 +469,23 @@ score_torrents() {
           | (any($tags[]; . as $tag | $protected | index($tag))) as $protected_by_tag
           | (((.upspeed // 0) > 0) or ((.dlspeed // 0) > 0) or
              ((.state // "") | test("^(checking|moving|allocating)"))) as $active
+          | (($allow_incomplete | not) and ($complete | not)) as $blocked_incomplete
+          | ($age_hours < $effective_retention) as $blocked_retention
+          | ($inactive_hours < $effective_min_inactive) as $blocked_inactivity
+          | ($ratio_protected) as $blocked_ratio
+          | ($protected_by_tag) as $blocked_tag
+          | ($skip_forced and (.force_start // false)) as $blocked_forced
+          | ($skip_active and $active) as $blocked_active
           | (((1 - capped_ratio($efficiency; $efficiency_full)) * $low_upload_weight)
              + (capped_ratio($size_gb; $size_full) * $size_weight)
              + (capped_ratio($inactive_hours; $inactivity_full) * $inactivity_weight)
              + ($competition * $competition_weight)) as $score
           | . + {
               is_complete: $complete,
-              retention_hours: $rule.retention_hours,
+              configured_retention_hours: $rule.retention_hours,
+              emergency_retention_hours: ($rule.emergency_retention_hours // $rule.retention_hours),
+              retention_hours: $effective_retention,
+              min_inactive_hours: $effective_min_inactive,
               min_ratio: $rule.min_ratio,
               ratio_protected: $ratio_protected,
               age_hours: ($age_hours | floor),
@@ -462,6 +502,15 @@ score_torrents() {
               cleanup_score: (($score * 100) | round / 100),
               protected_by_tag: $protected_by_tag,
               is_active_transfer: $active,
+              blockers: {
+                incomplete: $blocked_incomplete,
+                retention: $blocked_retention,
+                inactivity: $blocked_inactivity,
+                ratio: $blocked_ratio,
+                protected_tag: $blocked_tag,
+                forced: $blocked_forced,
+                active_transfer: $blocked_active
+              },
               history_next: {
                 uploaded: $next_uploaded,
                 sampled_at: $next_sampled_at,
@@ -470,13 +519,13 @@ score_torrents() {
                 observed_seconds: $observed_seconds
               },
               eligible: (
-                ($allow_incomplete or $complete)
-                and ($age_hours >= $rule.retention_hours)
-                and ($inactive_hours >= $min_inactive)
-                and ($ratio_protected | not)
-                and ($protected_by_tag | not)
-                and (($skip_forced and (.force_start // false)) | not)
-                and (($skip_active and $active) | not)
+                ($blocked_incomplete | not)
+                and ($blocked_retention | not)
+                and ($blocked_inactivity | not)
+                and ($blocked_ratio | not)
+                and ($blocked_tag | not)
+                and ($blocked_forced | not)
+                and ($blocked_active | not)
               )
             }
         )
@@ -560,6 +609,53 @@ choose_mode() {
   fi
 }
 
+estimate_path_reclaimable_bytes() {
+  local path="$1" links blocks
+  if [[ -f "${path}" ]]; then
+    read -r links blocks < <(stat -c '%h %b' -- "${path}" 2>/dev/null) || {
+      printf '0'
+      return 0
+    }
+    if ((links == 1)); then
+      printf '%s' "$((blocks * 512))"
+    else
+      printf '0'
+    fi
+    return 0
+  fi
+  if [[ -d "${path}" ]]; then
+    find "${path}" -xdev -type f -links 1 -printf '%b\n' 2>/dev/null |
+      awk '{blocks += $1} END {printf "%.0f", blocks * 512}'
+    return 0
+  fi
+  printf '0'
+}
+
+enrich_reclaimability() {
+  local scored_json="$1" mapping hash encoded_path path bytes
+  if [[ "${DISK_PRESSURE_ENABLED}" != "true" || "${DELETE_FILES}" != "true" ]]; then
+    jq -c 'map(. + {physical_reclaimable_bytes:null, physical_reclaim_estimated:false})' \
+      <<<"${scored_json}"
+    return 0
+  fi
+
+  mapping="$(
+    while IFS=$'\t' read -r hash encoded_path; do
+      path="$(printf '%s' "${encoded_path}" | base64 --decode 2>/dev/null || true)"
+      bytes="$(estimate_path_reclaimable_bytes "${path}")"
+      printf '%s\t%s\n' "${hash}" "${bytes:-0}"
+    done < <(jq -r '.[] | [(.hash // ""), ((.content_path // "") | @base64)] | @tsv' <<<"${scored_json}") |
+      jq -Rn '[inputs | split("\t") | {key:.[0], value:(.[1] | tonumber)}] | from_entries'
+  )"
+
+  jq -c --argjson mapping "${mapping}" '
+    map(. + {
+      physical_reclaimable_bytes: ($mapping[.hash] // 0),
+      physical_reclaim_estimated: true
+    })
+  ' <<<"${scored_json}"
+}
+
 select_candidates() {
   local scored_json="$1"
   local threshold bytes_limit without_history max_count max_reclaim_gb
@@ -597,18 +693,25 @@ select_candidates() {
     --argjson wanted_bytes "${bytes_limit}" \
     --argjson max_reclaim_bytes "${max_reclaim_bytes}" '
       [ .[]
+        | .selection_bytes = (
+            if ($mode != "normal" and .physical_reclaim_estimated)
+            then (.physical_reclaimable_bytes // 0)
+            else (.size_bytes // 0)
+            end
+          )
         | select(.eligible)
         | select(.history_ready or ($mode != "normal" and $without_history))
         | select(.cleanup_score >= $threshold)
+        | select(($mode == "normal") or (.selection_bytes > 0))
       ]
-      | sort_by(.cleanup_score, .size_bytes) | reverse
+      | sort_by(.cleanup_score, .selection_bytes) | reverse
       | reduce .[] as $torrent
           ({items: [], bytes: 0};
             if ((.items | length) >= $max_count)
                or ($wanted_bytes > 0 and .bytes >= $wanted_bytes)
                or ($max_reclaim_bytes > 0 and .bytes >= $max_reclaim_bytes)
             then .
-            else .items += [$torrent] | .bytes += $torrent.size_bytes
+            else .items += [$torrent] | .bytes += $torrent.selection_bytes
             end)
       | .items
     ' <<<"${scored_json}"
@@ -620,23 +723,39 @@ human_gib() {
 
 show_policy_summary() {
   local scored_json="$1" selected_json="$2" total="$3"
-  local managed eligible history_ready selected planned
+  local managed eligible history_ready selected planned planned_physical blockers
   managed="$(jq 'length' <<<"${scored_json}")"
   eligible="$(jq '[.[] | select(.eligible)] | length' <<<"${scored_json}")"
   history_ready="$(jq '[.[] | select(.history_ready)] | length' <<<"${scored_json}")"
   selected="$(jq 'length' <<<"${selected_json}")"
   planned="$(jq '[.[].size_bytes] | add // 0' <<<"${selected_json}")"
+  planned_physical="$(jq '[.[].selection_bytes // 0] | add // 0' <<<"${selected_json}")"
 
-  log "INFO" "modo=${RUN_MODE}; gerenciados=${managed}/${total}; historico_pronto=${history_ready}; elegiveis=${eligible}; selecionados=${selected}; recuperacao_estimada=$(human_gib "${planned}")"
+  log "INFO" "modo=${RUN_MODE}; gerenciados=${managed}/${total}; historico_pronto=${history_ready}; elegiveis=${eligible}; selecionados=${selected}; tamanho_logico=$(human_gib "${planned}"); recuperacao_fisica_estimada=$(human_gib "${planned_physical}")"
   if [[ "${DISK_PRESSURE_ENABLED}" == "true" ]]; then
     log "INFO" "disco livre=$(human_gib "${DISK_FREE_BYTES}"); emergencia=$(human_gib "${CRITICAL_WATERMARK_BYTES}"); gatilho=$(human_gib "${LOW_WATERMARK_BYTES}"); alvo=$(human_gib "${HIGH_WATERMARK_BYTES}")"
   fi
+  blockers="$(jq -r '
+    def blocked($name): [.[] | select(.blockers[$name] // false)];
+    [
+      ["retencao", blocked("retention")],
+      ["inatividade", blocked("inactivity")],
+      ["ratio", blocked("ratio")],
+      ["transferencia", blocked("active_transfer")],
+      ["tag", blocked("protected_tag")],
+      ["forcado", blocked("forced")],
+      ["incompleto", blocked("incomplete")]
+    ]
+    | map("\(.[0])=\(.[1]|length)/\(([.[1][] | .size_bytes] | add // 0) / 1073741824 * 10 | round / 10)GiB")
+    | join("; ")
+  ' <<<"${scored_json}")"
+  log "INFO" "bloqueios (podem se sobrepor): ${blockers}; categorias_nao_listadas=$((total - managed))"
 
   if ((selected > 0)); then
     local list_limit=5
     [[ "${LOG_LEVEL}" == "detailed" ]] && list_limit="${selected}"
     jq -r --argjson limit "${list_limit}" '.[:$limit][] |
-      "  score=\(.cleanup_score) eficiencia=\(.upload_efficiency_mib_per_gib_day)MiB/GiB/dia size=\(.size_gb)GiB inativo=\(.inactive_hours)h swarm=\(.swarm_seeds)S/\(.swarm_leechers)L ratio=\(.ratio) categoria=\(.category) :: \(.name)"' \
+      "  score=\(.cleanup_score) eficiencia=\(.upload_efficiency_mib_per_gib_day)MiB/GiB/dia size=\(.size_gb)GiB fisico=\((.selection_bytes // 0)/1073741824*100|round/100)GiB inativo=\(.inactive_hours)h swarm=\(.swarm_seeds)S/\(.swarm_leechers)L ratio=\(.ratio) categoria=\(.category) :: \(.name)"' \
       <<<"${selected_json}"
     if ((selected > list_limit)); then
       log "INFO" "$((selected - list_limit)) item(ns) adicional(is) omitido(s); use LOG_LEVEL=detailed"
@@ -698,6 +817,22 @@ emit_policy_snapshot() {
           history_ready: ([$torrents[] | select(.history_ready)] | length),
           eligible_torrents: ([$torrents[] | select(.eligible)] | length),
           selected_torrents: ($selected_hashes | length),
+          selected_logical_bytes: (
+            [$torrents[] | select(selected(.hash)) | (.size_bytes // 0)] | add // 0
+          ),
+          estimated_physical_reclaim_bytes: (
+            [$torrents[] | select(selected(.hash)) |
+              (.physical_reclaimable_bytes // .size_bytes // 0)] | add // 0
+          ),
+          blockers: {
+            retention: ([$torrents[] | select(.blockers.retention // false)] | length),
+            inactivity: ([$torrents[] | select(.blockers.inactivity // false)] | length),
+            ratio: ([$torrents[] | select(.blockers.ratio // false)] | length),
+            active_transfer: ([$torrents[] | select(.blockers.active_transfer // false)] | length),
+            protected_tag: ([$torrents[] | select(.blockers.protected_tag // false)] | length),
+            forced: ([$torrents[] | select(.blockers.forced // false)] | length),
+            incomplete: ([$torrents[] | select(.blockers.incomplete // false)] | length)
+          },
           scores: {
             average: rounded_average($scores),
             minimum: ($scores | min // 0),
@@ -719,6 +854,16 @@ emit_policy_snapshot() {
                     history_ready: ([$items[] | select(.history_ready)] | length),
                     eligible: ([$items[] | select(.eligible)] | length),
                     selected: ([$items[] | select(selected(.hash))] | length),
+                    estimated_physical_reclaim_bytes: (
+                      [$items[] | select(selected(.hash)) |
+                        (.physical_reclaimable_bytes // .size_bytes // 0)] | add // 0
+                    ),
+                    blockers: {
+                      retention: ([$items[] | select(.blockers.retention // false)] | length),
+                      inactivity: ([$items[] | select(.blockers.inactivity // false)] | length),
+                      ratio: ([$items[] | select(.blockers.ratio // false)] | length),
+                      active_transfer: ([$items[] | select(.blockers.active_transfer // false)] | length)
+                    },
                     average_score: rounded_average($category_scores),
                     maximum_score: ($category_scores | max // 0)
                   }
@@ -735,6 +880,7 @@ emit_policy_snapshot() {
                 name: (.name // ""),
                 category: (.category // ""),
                 size_bytes: (.size_bytes // 0),
+                physical_reclaimable_bytes: (.physical_reclaimable_bytes // null),
                 score: (.cleanup_score // 0),
                 upload_efficiency: (.upload_efficiency_mib_per_gib_day // 0),
                 upload_speed_bps: (.upspeed // 0),
@@ -744,6 +890,7 @@ emit_policy_snapshot() {
                 leechers: (.swarm_leechers // 0),
                 history_ready: (.history_ready // false),
                 eligible: (.eligible // false),
+                blockers: (.blockers // {}),
                 selected: selected(.hash)
               })
           )
@@ -756,15 +903,19 @@ emit_policy_snapshot() {
 }
 
 delete_torrents() {
-  local selected_json="$1" count hashes response planned_bytes released_bytes event_time item
+  local selected_json="$1" count hashes response planned_bytes estimated_physical_bytes
+  local released_bytes event_time item free_before=0 free_after=0 measurement_available=false
+  local best_free=0 current_free=0 deadline=0 stable_samples=0 target_released=0
   count="$(jq 'length' <<<"${selected_json}")"
   planned_bytes="$(jq '[.[].size_bytes] | add // 0' <<<"${selected_json}")"
+  estimated_physical_bytes="$(jq '[.[].selection_bytes // 0] | add // 0' <<<"${selected_json}")"
 
   if ((count == 0)); then
     emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
       --argjson dry_run "${DRY_RUN}" \
       '{event:"deletion_summary", run_id:$run_id, timestamp:$timestamp, dry_run:$dry_run,
-        planned_count:0, planned_bytes:0, deleted_count:0, released_bytes:0}')"
+        planned_count:0, planned_bytes:0, estimated_physical_reclaim_bytes:0,
+        deleted_count:0, released_bytes:0, physical_measurement_available:false}')"
     return 0
   fi
 
@@ -772,11 +923,18 @@ delete_torrents() {
     log "DRY-RUN" "nenhuma exclusao executada"
     emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
       --argjson planned_count "${count}" --argjson planned_bytes "${planned_bytes}" \
+      --argjson estimated_physical_bytes "${estimated_physical_bytes}" \
       '{event:"deletion_summary", run_id:$run_id, timestamp:$timestamp, dry_run:true,
-        planned_count:$planned_count, planned_bytes:$planned_bytes, deleted_count:0, released_bytes:0}')"
+        planned_count:$planned_count, planned_bytes:$planned_bytes,
+        estimated_physical_reclaim_bytes:$estimated_physical_bytes,
+        deleted_count:0, released_bytes:0, physical_measurement_available:false}')"
     return 0
   fi
 
+  if [[ "${DISK_PRESSURE_ENABLED}" == "true" ]]; then
+    read -r _ free_before < <(filesystem_status)
+    measurement_available=true
+  fi
   hashes="$(jq -r '.[].hash' <<<"${selected_json}" | paste -sd'|' -)"
   response="$(curl "${CURL_COMMON[@]}" -b "${COOKIE_JAR}" -X POST \
     --data-urlencode "hashes=${hashes}" --data "deleteFiles=${DELETE_FILES}" \
@@ -786,7 +944,32 @@ delete_torrents() {
 
   event_time="$(date --iso-8601=seconds)"
   released_bytes=0
-  [[ "${DELETE_FILES}" == "false" ]] || released_bytes="${planned_bytes}"
+  if [[ "${measurement_available}" == "true" ]]; then
+    best_free="${free_before}"
+    target_released=$((estimated_physical_bytes * 9 / 10))
+    deadline=$((SECONDS + PHYSICAL_MEASURE_TIMEOUT_SECONDS))
+    log "INFO" "aguardando a exclusao assincrona do qBittorrent por ate ${PHYSICAL_MEASURE_TIMEOUT_SECONDS}s"
+    while ((SECONDS < deadline)); do
+      sleep "${PHYSICAL_MEASURE_INTERVAL_SECONDS}"
+      read -r _ current_free < <(filesystem_status)
+      if ((current_free > best_free)); then
+        best_free="${current_free}"
+        stable_samples=0
+      else
+        ((stable_samples += 1))
+      fi
+      released_bytes=$((best_free - free_before))
+      if ((target_released > 0 && released_bytes >= target_released)); then
+        break
+      fi
+      if ((released_bytes > 0 && stable_samples >= 6)); then
+        break
+      fi
+    done
+    free_after="${best_free}"
+    released_bytes=$((free_after - free_before))
+  fi
+  log "INFO" "exclusao concluida: logico=$(human_gib "${planned_bytes}"); fisico_estimado=$(human_gib "${estimated_physical_bytes}"); fisico_observado=$(human_gib "${released_bytes}")"
   while IFS= read -r item; do
     emit_event "${item}"
   done < <(jq -c --arg run_id "${RUN_ID}" --arg timestamp "${event_time}" \
@@ -794,15 +977,21 @@ delete_torrents() {
       .[] | {
         event:"torrent_deleted", run_id:$run_id, timestamp:$timestamp,
         name:(.name // ""), category:(.category // ""), size_bytes:(.size_bytes // 0),
-        released_bytes:(if $delete_files then (.size_bytes // 0) else 0 end)
+        estimated_physical_reclaim_bytes:(
+          if $delete_files then (.physical_reclaimable_bytes // .size_bytes // 0) else 0 end
+        )
       }' <<<"${selected_json}")
   emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "${event_time}" \
     --argjson planned_count "${count}" --argjson planned_bytes "${planned_bytes}" \
+    --argjson estimated_physical_bytes "${estimated_physical_bytes}" \
     --argjson deleted_count "${count}" --argjson released_bytes "${released_bytes}" \
+    --argjson measurement_available "${measurement_available}" \
     --argjson delete_files "${DELETE_FILES}" \
     '{event:"deletion_summary", run_id:$run_id, timestamp:$timestamp, dry_run:false,
       delete_files:$delete_files, planned_count:$planned_count, planned_bytes:$planned_bytes,
-      deleted_count:$deleted_count, released_bytes:$released_bytes}')"
+      estimated_physical_reclaim_bytes:$estimated_physical_bytes,
+      deleted_count:$deleted_count, released_bytes:$released_bytes,
+      physical_measurement_available:$measurement_available}')"
 }
 
 main() {
@@ -836,9 +1025,9 @@ main() {
   rules_json="$(rules_as_json)"
   state_json="$(load_state)"
   now_epoch="$(date +%s)"
-  scored_json="$(score_torrents "${now_epoch}" "${rules_json}" "${state_json}" <<<"${raw_json}")"
-
   choose_mode
+  scored_json="$(score_torrents "${now_epoch}" "${rules_json}" "${state_json}" <<<"${raw_json}")"
+  scored_json="$(enrich_reclaimability "${scored_json}")"
   selected_json="$(select_candidates "${scored_json}")"
   show_policy_summary "${scored_json}" "${selected_json}" "$(jq 'length' <<<"${raw_json}")"
   save_state "${scored_json}" "${now_epoch}" ||

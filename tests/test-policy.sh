@@ -21,6 +21,10 @@ assert_eq "${MAX_RECLAIM_GB_PER_RUN}" "500" "perfil racing: limite estimado por 
 assert_eq "${EMERGENCY_WITHOUT_HISTORY}" "true" "emergencia aceita sem historico"
 assert_eq "${EMERGENCY_MAX_DELETE_PER_RUN}" "30" "limite de itens na emergencia"
 assert_eq "${EMERGENCY_MAX_RECLAIM_GB_PER_RUN}" "800" "limite estimado na emergencia"
+assert_eq "${AGGRESSIVE_MIN_INACTIVE_HOURS}" "2" "inatividade agressiva"
+assert_eq "${EMERGENCY_MIN_INACTIVE_HOURS}" "0" "emergencia dispensa inatividade passada"
+assert_eq "${PHYSICAL_MEASURE_TIMEOUT_SECONDS}" "300" "janela de medicao fisica"
+assert_eq "${PHYSICAL_MEASURE_INTERVAL_SECONDS}" "5" "intervalo de medicao fisica"
 
 now=2000000000
 rules='{"Categoria Filmes":{"retention_hours":48,"min_ratio":1.0}}'
@@ -105,6 +109,42 @@ RUN_MODE="emergency"
 BYTES_NEEDED=1073741824
 selected="$(select_candidates "${without_history}")"
 assert_eq "$(jq -r 'length' <<<"${selected}")" "1" "emergencia evita disco cheio sem historico"
+
+shared_only="$(jq -c 'map(.physical_reclaim_estimated=true | .physical_reclaimable_bytes=0)' <<<"${without_history}")"
+selected="$(select_candidates "${shared_only}")"
+assert_eq "$(jq -r 'length' <<<"${selected}")" "0" "pressao ignora item que nao libera blocos fisicos"
+
+emergency_rules='{"Categoria Filmes":{"retention_hours":168,"emergency_retention_hours":96,"min_ratio":1.0}}'
+recently_active="$(jq -cn --argjson now "${now}" '[
+  {
+    hash:"emergency", name:"ocioso recente", category:"Categoria Filmes",
+    progress:1, amount_left:0, completion_on:($now - 120*3600),
+    last_activity:($now - 3600), size:(10*1073741824), total_size:(10*1073741824),
+    uploaded:0, ratio:2, num_complete:20, num_incomplete:0,
+    upspeed:0, dlspeed:0, state:"stalledUP", force_start:false, tags:"",
+    content_path:"/arquivo-inexistente"
+  },
+  {
+    hash:"ignored", name:"categoria nao listada", category:"MEUS Protegidos",
+    progress:1, amount_left:0, completion_on:($now - 1000*3600),
+    last_activity:($now - 1000*3600), size:(10*1073741824), total_size:(10*1073741824),
+    uploaded:0, ratio:2, num_complete:20, num_incomplete:0,
+    upspeed:0, dlspeed:0, state:"stalledUP", force_start:false, tags:""
+  }
+]')"
+emergency_scored="$(score_torrents "${now}" "${emergency_rules}" '{"version":1,"torrents":{}}' <<<"${recently_active}")"
+assert_eq "$(jq -r 'length' <<<"${emergency_scored}")" "1" "somente categoria listada entra na politica"
+assert_eq "$(jq -r '.[0].retention_hours' <<<"${emergency_scored}")" "96" "retencao especifica de emergencia"
+assert_eq "$(jq -r '.[0].min_inactive_hours' <<<"${emergency_scored}")" "0" "inatividade efetiva da emergencia"
+assert_eq "$(jq -r '.[0].eligible' <<<"${emergency_scored}")" "true" "emergencia aceita ocioso recente"
+
+reclaim_test_dir="$(mktemp -d -t qbit-reclaim-test.XXXXXX)"
+printf 'dados' >"${reclaim_test_dir}/original"
+single_bytes="$(estimate_path_reclaimable_bytes "${reclaim_test_dir}/original")"
+((single_bytes > 0)) || fail "arquivo sem hardlink deveria liberar blocos"
+ln "${reclaim_test_dir}/original" "${reclaim_test_dir}/link"
+assert_eq "$(estimate_path_reclaimable_bytes "${reclaim_test_dir}/original")" "0" "hardlink nao libera blocos sozinho"
+rm -rf -- "${reclaim_test_dir}"
 
 # Com 100% como piso, qualquer filesystem real entra em pressao.
 DISK_PRESSURE_ENABLED="true"
