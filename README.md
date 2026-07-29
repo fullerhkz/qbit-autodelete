@@ -43,11 +43,13 @@ HIGH_WATERMARK_PERCENT="30"
 NORMAL_MIN_SCORE="65"
 AGGRESSIVE_MIN_SCORE="30"
 AGGRESSIVE_WITHOUT_HISTORY="false"
+AGGRESSIVE_MIN_INACTIVE_HOURS="2"
 MAX_DELETE_PER_RUN="20"
 MAX_RECLAIM_GB_PER_RUN="500"
 
 EMERGENCY_MIN_SCORE="0"
 EMERGENCY_WITHOUT_HISTORY="true"
+EMERGENCY_MIN_INACTIVE_HOURS="0"
 EMERGENCY_MAX_DELETE_PER_RUN="30"
 EMERGENCY_MAX_RECLAIM_GB_PER_RUN="800"
 ```
@@ -64,9 +66,9 @@ e ratio coerentes com cada tracker; as tags `keep` e `never-delete` continuam se
 protecao absoluta.
 
 Somente na emergencia, `EMERGENCY_WITHOUT_HISTORY=true` permite considerar um item sem
-as seis horas de aprendizado. Isso nao ignora categoria, retencao, ratio, inatividade,
-tags, estado incompleto nem transferencia ativa: apenas dispensa o historico de upload
-para evitar disco cheio.
+as seis horas de aprendizado. `EMERGENCY_MIN_INACTIVE_HOURS=0` dispensa a inatividade
+passada, mas categoria, retencao de emergencia, ratio, tags, estado incompleto e
+transferencia ativa continuam protegidos.
 
 O timer verifica a politica a cada 30 minutos. A consulta e leve e o contador acumulado
 captura o upload entre execucoes, inclusive picos curtos. Os limites de 20 itens/500 GiB
@@ -79,7 +81,7 @@ todo o volume, independentemente deste script.
 Um torrent so pode ser candidato depois de passar pelas protecoes:
 
 - pertence a uma categoria configurada;
-- cumpriu a retencao minima da categoria;
+- cumpriu a retencao normal ou a retencao especifica de emergencia da categoria;
 - cumpriu o ratio minimo ou atingiu o prazo maximo de protecao de ratio;
 - esta completo (padrao seguro);
 - ficou inativo pelo tempo minimo;
@@ -128,15 +130,19 @@ No modo normal, apenas candidatos com `NORMAL_MIN_SCORE` sao removidos. Sob pres
 de disco, o limite passa a `AGGRESSIVE_MIN_SCORE`. Abaixo do limite critico entra o
 modo de emergencia, com lote proprio e permissao configuravel para candidatos sem
 historico. Em todos os modos, os itens de maior pontuacao sao selecionados ate o espaco
-estimado atingir o alvo, o limite de itens ou o limite de GiB por execucao.
+estimado atingir o alvo, o limite de itens ou o limite de GiB por execucao. Sob
+pressao, caminhos cujos arquivos so possuem blocos mantidos por hardlinks nao contam
+como capacidade recuperavel e nao consomem o lote.
 
 O historico e gravado de forma atomica, e o resumo usado por `qbit-del log` e produzido
 como telemetria auxiliar. Uma falha apenas nesses dados gera aviso, mas nao cancela uma
 exclusao ja planejada. Isso evita que falta de espaco ou um resumo muito grande bloqueiem
 justamente a rotina responsavel por recuperar capacidade.
 
-> O espaco recuperado e uma estimativa. Hardlinks, snapshots, arquivos compartilhados
-> e a exclusao assincrona pelo qBittorrent podem fazer o valor real ser diferente.
+O resumo separa tamanho logico, estimativa fisica pela contagem de hardlinks e variacao
+real observada no filesystem antes/depois da API. Como o qBittorrent pode excluir os
+arquivos depois de responder, `PHYSICAL_MEASURE_TIMEOUT_SECONDS` controla por quanto
+tempo o script acompanha o `df`. Escritas concorrentes ainda podem afetar a medicao.
 
 ## Instalador interativo (recomendado)
 
@@ -255,13 +261,15 @@ sudo editor /PATH/TO/qbit-autodelete.categories
 As categorias aceitam espacos e um ratio minimo opcional:
 
 ```text
-Categoria-Filmes|48|1.0
-Categoria-Series|72|1.0
-Tracker-Privado|168|2.0
+Categoria-Filmes|48|1.0|36
+Categoria-Series|72|1.0|48
+Tracker-Privado|168|2.0|120
 ```
 
-O formato e `Categoria|horas|min_ratio`. O terceiro campo pode ser omitido para usar
-`DEFAULT_MIN_RATIO`. As horas sao uma **retencao minima**, nao uma ordem automatica de exclusao. A categoria
+O formato e `Categoria|horas_normais|min_ratio|horas_emergencia`. O terceiro campo pode
+ser omitido para usar `DEFAULT_MIN_RATIO`; o quarto usa as horas normais quando omitido
+e nao pode ser maior que elas. As horas sao uma **retencao minima**, nao uma ordem
+automatica de exclusao. A categoria
 deve coincidir exatamente com o qBittorrent. Para instalar em outro servidor, basta
 copiar o script e criar novos arquivos em `/etc`; URL, porta, credenciais, caminhos e
 politica nao ficam misturados ao codigo.

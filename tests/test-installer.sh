@@ -60,6 +60,8 @@ cp "${SOURCE_TIMER}" "${TEMP_ROOT}/systemd/qbit-autodelete.timer"
   assert_eq "${LOW_WATERMARK_PERCENT}" "20" "gatilho agressivo"
   assert_eq "${HIGH_WATERMARK_PERCENT}" "30" "alvo de espaco"
   assert_eq "${EMERGENCY_WITHOUT_HISTORY}" "true" "perfil de emergencia"
+  assert_eq "${AGGRESSIVE_MIN_INACTIVE_HOURS}" "2" "inatividade agressiva"
+  assert_eq "${EMERGENCY_MIN_INACTIVE_HOURS}" "0" "inatividade de emergencia"
 )
 
 assert_contains "${TEMP_ROOT}/new.categories" "Filmes 4K|48|1.0"

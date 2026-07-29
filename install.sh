@@ -563,10 +563,12 @@ prepare_config() {
     replace_assignment "${destination}" NORMAL_MIN_SCORE "65"
     replace_assignment "${destination}" AGGRESSIVE_MIN_SCORE "30"
     replace_assignment "${destination}" AGGRESSIVE_WITHOUT_HISTORY "false"
+    replace_assignment "${destination}" AGGRESSIVE_MIN_INACTIVE_HOURS "2"
     replace_assignment "${destination}" MAX_DELETE_PER_RUN "20"
     replace_assignment "${destination}" MAX_RECLAIM_GB_PER_RUN "500"
     replace_assignment "${destination}" EMERGENCY_MIN_SCORE "0"
     replace_assignment "${destination}" EMERGENCY_WITHOUT_HISTORY "true"
+    replace_assignment "${destination}" EMERGENCY_MIN_INACTIVE_HOURS "0"
     replace_assignment "${destination}" EMERGENCY_MAX_DELETE_PER_RUN "30"
     replace_assignment "${destination}" EMERGENCY_MAX_RECLAIM_GB_PER_RUN "800"
     replace_assignment "${destination}" HISTORY_MIN_SAMPLE_SECONDS "1500"
@@ -577,7 +579,7 @@ prepare_categories() {
   local destination="$1" entry
   {
     printf '# Gerenciado por qbit-autodelete-installer.\n'
-    printf '# Formato: Categoria|retencao_minima_horas|ratio_minimo\n\n'
+    printf '# Formato: Categoria|retencao_normal_horas|ratio_minimo|retencao_emergencia_horas\n\n'
     for entry in "${CATEGORIES[@]}"; do
       printf '%s\n' "${entry}"
     done
