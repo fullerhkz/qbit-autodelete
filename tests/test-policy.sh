@@ -23,6 +23,7 @@ assert_eq "${EMERGENCY_MAX_DELETE_PER_RUN}" "30" "limite de itens na emergencia"
 assert_eq "${EMERGENCY_MAX_RECLAIM_GB_PER_RUN}" "800" "limite estimado na emergencia"
 assert_eq "${AGGRESSIVE_MIN_INACTIVE_HOURS}" "2" "inatividade agressiva"
 assert_eq "${EMERGENCY_MIN_INACTIVE_HOURS}" "0" "emergencia dispensa inatividade passada"
+assert_eq "${EMERGENCY_RATIO_PROTECTION_MAX_HOURS}" "336" "emergencia herda protecao de ratio"
 assert_eq "${PHYSICAL_MEASURE_TIMEOUT_SECONDS}" "300" "janela de medicao fisica"
 assert_eq "${PHYSICAL_MEASURE_INTERVAL_SECONDS}" "5" "intervalo de medicao fisica"
 
@@ -94,6 +95,18 @@ assert_eq "$(jq -r '.[] | select(.hash=="under_ratio") | .ratio_protected' <<<"$
 assert_eq "$(jq -r '.[] | select(.hash=="young") | .eligible' <<<"${scored}")" "false" "retencao minima"
 assert_eq "$(jq -r '.[] | select(.hash=="partial") | .is_complete' <<<"${scored}")" "false" "seen_complete nao e conclusao local"
 assert_eq "$(jq -r '.[] | select(.hash=="partial") | .eligible' <<<"${scored}")" "false" "incompleto protegido"
+
+RUN_MODE="emergency"
+EMERGENCY_RATIO_PROTECTION_MAX_HOURS=24
+emergency_ratio_scored="$(score_torrents "${now}" "${rules}" "${history}" <<<"${input}")"
+assert_eq "$(jq -r '.[] | select(.hash=="under_ratio") | .ratio_protection_max_hours' <<<"${emergency_ratio_scored}")" "24" "prazo de ratio da emergencia"
+assert_eq "$(jq -r '.[] | select(.hash=="under_ratio") | .ratio_protected' <<<"${emergency_ratio_scored}")" "false" "emergencia libera ratio antigo"
+assert_eq "$(jq -r '.[] | select(.hash=="under_ratio") | .eligible' <<<"${emergency_ratio_scored}")" "true" "ratio antigo fica elegivel somente na emergencia"
+
+RUN_MODE="normal"
+normal_ratio_scored="$(score_torrents "${now}" "${rules}" "${history}" <<<"${input}")"
+assert_eq "$(jq -r '.[] | select(.hash=="under_ratio") | .ratio_protected' <<<"${normal_ratio_scored}")" "true" "prazo normal de ratio permanece intacto"
+EMERGENCY_RATIO_PROTECTION_MAX_HOURS="${RATIO_PROTECTION_MAX_HOURS}"
 
 RUN_MODE="normal"
 selected="$(select_candidates "${scored}")"

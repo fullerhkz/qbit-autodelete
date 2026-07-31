@@ -50,6 +50,7 @@ MAX_RECLAIM_GB_PER_RUN="500"
 EMERGENCY_MIN_SCORE="0"
 EMERGENCY_WITHOUT_HISTORY="true"
 EMERGENCY_MIN_INACTIVE_HOURS="0"
+EMERGENCY_RATIO_PROTECTION_MAX_HOURS="48"
 EMERGENCY_MAX_DELETE_PER_RUN="30"
 EMERGENCY_MAX_RECLAIM_GB_PER_RUN="800"
 ```
@@ -67,8 +68,9 @@ protecao absoluta.
 
 Somente na emergencia, `EMERGENCY_WITHOUT_HISTORY=true` permite considerar um item sem
 as seis horas de aprendizado. `EMERGENCY_MIN_INACTIVE_HOURS=0` dispensa a inatividade
-passada, mas categoria, retencao de emergencia, ratio, tags, estado incompleto e
-transferencia ativa continuam protegidos.
+passada. `EMERGENCY_RATIO_PROTECTION_MAX_HOURS` pode encurtar apenas nesse modo o prazo
+de protecao de um torrent abaixo do ratio; a categoria, a retencao de emergencia, tags,
+estado incompleto e transferencia ativa continuam protegidos.
 
 O timer verifica a politica a cada 30 minutos. A consulta e leve e o contador acumulado
 captura o upload entre execucoes, inclusive picos curtos. Os limites de 20 itens/500 GiB
@@ -133,6 +135,20 @@ historico. Em todos os modos, os itens de maior pontuacao sao selecionados ate o
 estimado atingir o alvo, o limite de itens ou o limite de GiB por execucao. Sob
 pressao, caminhos cujos arquivos so possuem blocos mantidos por hardlinks nao contam
 como capacidade recuperavel e nao consomem o lote.
+
+Uma categoria de links do cross-seed pode ser limitada ao modo de emergencia usando
+uma retencao normal deliberadamente impraticavel e uma retencao de emergencia real:
+
+```text
+cross-seed-link|87600|1.0|24
+```
+
+Assim, a limpeza normal nao encerra cross-seeds. Sob emergencia, o estimador ainda
+seleciona apenas os itens cuja remocao realmente libera blocos, como arquivos que
+viraram o ultimo hardlink depois que a origem foi removida. O qBittorrent pode deixar
+arquivos extras sem referencia dentro do `linkDir`; o cross-seed nao remove esses
+orfaos. Use uma ferramenta propria, como `qbit_manage --rem-orphaned`, limitada ao
+`linkDir` e validada primeiro com `--dry-run`.
 
 O historico e gravado de forma atomica, e o resumo usado por `qbit-del log` e produzido
 como telemetria auxiliar. Uma falha apenas nesses dados gera aviso, mas nao cancela uma

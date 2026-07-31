@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.4.0"
+VERSION="3.5.0"
 
 declare -A RETENTION_HOURS=()
 declare -A EMERGENCY_RETENTION_HOURS=()
@@ -94,6 +94,7 @@ load_config() {
   NO_CATEGORY_RETENTION_HOURS="${NO_CATEGORY_RETENTION_HOURS:-168}"
   DEFAULT_MIN_RATIO="${DEFAULT_MIN_RATIO:-1.0}"
   RATIO_PROTECTION_MAX_HOURS="${RATIO_PROTECTION_MAX_HOURS:-336}"
+  EMERGENCY_RATIO_PROTECTION_MAX_HOURS="${EMERGENCY_RATIO_PROTECTION_MAX_HOURS:-${RATIO_PROTECTION_MAX_HOURS}}"
   PROTECTED_TAGS="${PROTECTED_TAGS:-keep,never-delete}"
   SKIP_FORCE_STARTED="${SKIP_FORCE_STARTED:-true}"
   SKIP_ACTIVE_TRANSFERS="${SKIP_ACTIVE_TRANSFERS:-true}"
@@ -231,7 +232,8 @@ validate_config() {
   done
 
   local uint_name
-  for uint_name in NO_CATEGORY_RETENTION_HOURS RATIO_PROTECTION_MAX_HOURS MIN_INACTIVE_HOURS \
+  for uint_name in NO_CATEGORY_RETENTION_HOURS RATIO_PROTECTION_MAX_HOURS \
+    EMERGENCY_RATIO_PROTECTION_MAX_HOURS MIN_INACTIVE_HOURS \
     AGGRESSIVE_MIN_INACTIVE_HOURS EMERGENCY_MIN_INACTIVE_HOURS MAX_DELETE_PER_RUN \
     MAX_RECLAIM_GB_PER_RUN EMERGENCY_MAX_DELETE_PER_RUN EMERGENCY_MAX_RECLAIM_GB_PER_RUN \
     SCORE_LOW_UPLOAD_WEIGHT SCORE_SIZE_WEIGHT SCORE_INACTIVITY_WEIGHT \
@@ -392,6 +394,7 @@ score_torrents() {
     --argjson aggressive_min_inactive "${AGGRESSIVE_MIN_INACTIVE_HOURS}" \
     --argjson emergency_min_inactive "${EMERGENCY_MIN_INACTIVE_HOURS}" \
     --argjson ratio_protection_max_hours "${RATIO_PROTECTION_MAX_HOURS}" \
+    --argjson emergency_ratio_protection_max_hours "${EMERGENCY_RATIO_PROTECTION_MAX_HOURS}" \
     --argjson history_min_samples "${HISTORY_MIN_SAMPLES}" \
     --argjson history_min_hours "${HISTORY_MIN_HOURS}" \
     --argjson min_sample_seconds "${HISTORY_MIN_SAMPLE_SECONDS}" \
@@ -411,6 +414,9 @@ score_torrents() {
       | (if $mode == "emergency" then $emergency_min_inactive
          elif $mode == "aggressive" then $aggressive_min_inactive
          else $normal_min_inactive end) as $effective_min_inactive
+      | (if $mode == "emergency"
+         then $emergency_ratio_protection_max_hours
+         else $ratio_protection_max_hours end) as $effective_ratio_protection_max_hours
       |
       ($protected_tags | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))) as $protected
       | map(
@@ -464,7 +470,8 @@ score_torrents() {
              ($observed_seconds >= ($history_min_hours * 3600))) as $history_ready
           | ([.ratio // 0, 0] | max) as $current_ratio
           | (($rule.min_ratio > 0) and ($current_ratio < $rule.min_ratio) and
-             (($ratio_protection_max_hours == 0) or ($age_hours < $ratio_protection_max_hours))) as $ratio_protected
+             (($effective_ratio_protection_max_hours == 0) or
+              ($age_hours < $effective_ratio_protection_max_hours))) as $ratio_protected
           | (clean_tags) as $tags
           | (any($tags[]; . as $tag | $protected | index($tag))) as $protected_by_tag
           | (((.upspeed // 0) > 0) or ((.dlspeed // 0) > 0) or
@@ -487,6 +494,7 @@ score_torrents() {
               retention_hours: $effective_retention,
               min_inactive_hours: $effective_min_inactive,
               min_ratio: $rule.min_ratio,
+              ratio_protection_max_hours: $effective_ratio_protection_max_hours,
               ratio_protected: $ratio_protected,
               age_hours: ($age_hours | floor),
               inactive_hours: ($inactive_hours | floor),
