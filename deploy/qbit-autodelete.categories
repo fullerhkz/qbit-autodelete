@@ -1,0 +1,10 @@
+# Gerenciado por qbit-autodelete-installer.
+# Formato: Categoria|retencao_normal_horas|ratio_minimo|retencao_emergencia_horas
+
+BJ Animes|72|1.0|24
+BJ Cursos|120|1.0|36
+BJ Filmes|50|1.0|24
+BJ Jogos|168|1.0|72
+BJ Plus|168|1.0|72
+BJ Series|36|1.0|16
+cross-seed-link|87600|1.0|24
