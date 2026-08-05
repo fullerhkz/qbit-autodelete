@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.5.0"
+VERSION="3.6.0"
 
 declare -A RETENTION_HOURS=()
 declare -A EMERGENCY_RETENTION_HOURS=()
@@ -214,7 +214,7 @@ load_category_rules() {
 
 validate_config() {
   local cmd
-  for cmd in curl jq date df awk flock mktemp dirname mkdir mv chmod rm find stat base64; do
+  for cmd in curl jq date df awk flock mktemp dirname mkdir mv chmod rm find stat base64 sha256sum; do
     command -v "${cmd}" >/dev/null 2>&1 || die "dependencia ausente: ${cmd}"
   done
 
@@ -640,9 +640,15 @@ estimate_path_reclaimable_bytes() {
 }
 
 enrich_reclaimability() {
-  local scored_json="$1" mapping hash encoded_path path bytes
+  local scored_json="$1" mapping hash encoded_path path stats signature max_links bytes
   if [[ "${DISK_PRESSURE_ENABLED}" != "true" || "${DELETE_FILES}" != "true" ]]; then
-    jq -c 'map(. + {physical_reclaimable_bytes:null, physical_reclaim_estimated:false})' \
+    jq -c 'map(. + {
+      physical_reclaimable_bytes:null,
+      physical_reclaim_estimated:false,
+      physical_group_key:null,
+      physical_group_member_count:1,
+      physical_group_reclaimable_bytes:null
+    })' \
       <<<"${scored_json}"
     return 0
   fi
@@ -650,16 +656,55 @@ enrich_reclaimability() {
   mapping="$(
     while IFS=$'\t' read -r hash encoded_path; do
       path="$(printf '%s' "${encoded_path}" | base64 --decode 2>/dev/null || true)"
-      bytes="$(estimate_path_reclaimable_bytes "${path}")"
-      printf '%s\t%s\n' "${hash}" "${bytes:-0}"
+      stats=""
+      if [[ -f "${path}" ]]; then
+        stats="$(stat -c '%d:%i %h %b' -- "${path}" 2>/dev/null || true)"
+      elif [[ -d "${path}" ]]; then
+        stats="$(find "${path}" -xdev -type f -printf '%D:%i %n %b\n' 2>/dev/null |
+          sort -k1,1 -u)"
+      fi
+
+      if [[ -n "${stats}" ]]; then
+        signature="$(awk '{print $1}' <<<"${stats}" | sha256sum | awk '{print $1}')"
+        read -r max_links bytes < <(awk '
+          {if ($2 > max_links) max_links=$2; blocks += $3}
+          END {printf "%d %.0f\n", max_links, blocks * 512}
+        ' <<<"${stats}")
+        printf '%s\t%s\t%s\t%s\n' "${hash}" "${signature}" "${max_links:-0}" "${bytes:-0}"
+      else
+        printf '%s\t\t0\t0\n' "${hash}"
+      fi
     done < <(jq -r '.[] | [(.hash // ""), ((.content_path // "") | @base64)] | @tsv' <<<"${scored_json}") |
-      jq -Rn '[inputs | split("\t") | {key:.[0], value:(.[1] | tonumber)}] | from_entries'
+      jq -Rn '
+        [inputs | split("\t") | {
+          hash:.[0], signature:.[1], max_links:(.[2] | tonumber), bytes:(.[3] | tonumber)
+        }] as $rows
+        | reduce ($rows | map(select(.signature != "")) | group_by(.signature)[]) as $group
+            ({};
+              ($group | length) as $members
+              | ($group | map(.max_links) | max // 0) as $required_links
+              | ($group | map(.bytes) | max // 0) as $group_bytes
+              | reduce $group[] as $item (.;
+                  .[$item.hash] = {
+                    key:$item.signature,
+                    member_count:$members,
+                    reclaimable_bytes:(if $members >= $required_links then $group_bytes else 0 end),
+                    individual_reclaimable_bytes:(if $item.max_links <= 1 then $item.bytes else 0 end)
+                  }))
+        | reduce ($rows[] | select(.signature == "")) as $item (.;
+            .[$item.hash] = {
+              key:null, member_count:1, reclaimable_bytes:0, individual_reclaimable_bytes:0
+            })
+      '
   )"
 
   jq -c --argjson mapping "${mapping}" '
     map(. + {
-      physical_reclaimable_bytes: ($mapping[.hash] // 0),
-      physical_reclaim_estimated: true
+      physical_reclaimable_bytes: ($mapping[.hash].individual_reclaimable_bytes // 0),
+      physical_reclaim_estimated: true,
+      physical_group_key: ($mapping[.hash].key // null),
+      physical_group_member_count: ($mapping[.hash].member_count // 1),
+      physical_group_reclaimable_bytes: ($mapping[.hash].reclaimable_bytes // 0)
     })
   ' <<<"${scored_json}"
 }
@@ -700,28 +745,52 @@ select_candidates() {
     --argjson max_count "${max_count}" \
     --argjson wanted_bytes "${bytes_limit}" \
     --argjson max_reclaim_bytes "${max_reclaim_bytes}" '
-      [ .[]
-        | .selection_bytes = (
-            if ($mode != "normal" and .physical_reclaim_estimated)
-            then (.physical_reclaimable_bytes // 0)
-            else (.size_bytes // 0)
-            end
-          )
-        | select(.eligible)
+      def qualified:
+        select(.eligible)
         | select(.history_ready or ($mode != "normal" and $without_history))
-        | select(.cleanup_score >= $threshold)
-        | select(($mode == "normal") or (.selection_bytes > 0))
+        | select(.cleanup_score >= $threshold);
+      def group_key:
+        if $mode == "normal" then ("torrent:" + (.hash // ""))
+        else (.physical_group_key // ("torrent:" + (.hash // ""))) end;
+      def required_members:
+        if $mode == "normal" then 1 else (.physical_group_member_count // 1) end;
+      [group_by(group_key)[]
+        | . as $all_members
+        | [$all_members[] | qualified] as $members
+        | select(($members | length) == ($all_members[0] | required_members))
+        | (if $mode == "normal"
+           then ($members[0].size_bytes // 0)
+           elif ($members[0].physical_reclaim_estimated // false)
+           then ($members[0].physical_group_reclaimable_bytes //
+                 $members[0].physical_reclaimable_bytes // 0)
+           else ($members[0].physical_group_reclaimable_bytes //
+                 $members[0].physical_reclaimable_bytes // $members[0].size_bytes // 0)
+           end) as $group_bytes
+        | select(($mode == "normal") or ($group_bytes > 0))
+        | {
+            items:($members | sort_by(.cleanup_score, .size_bytes) | reverse),
+            count:($members | length),
+            bytes:$group_bytes,
+            rank:($members | map(.cleanup_score) | min // 0)
+          }
       ]
-      | sort_by(.cleanup_score, .selection_bytes) | reverse
-      | reduce .[] as $torrent
+      | sort_by(.rank, .bytes) | reverse
+      | reduce .[] as $group
           ({items: [], bytes: 0};
-            if ((.items | length) >= $max_count)
+            if (((.items | map(.count) | add // 0) + $group.count) > $max_count)
                or ($wanted_bytes > 0 and .bytes >= $wanted_bytes)
                or ($max_reclaim_bytes > 0 and .bytes >= $max_reclaim_bytes)
             then .
-            else .items += [$torrent] | .bytes += $torrent.selection_bytes
+            else .items += [$group] | .bytes += $group.bytes
             end)
-      | .items
+      | [.items[]
+          | . as $group
+          | $group.items | to_entries[]
+          | .value + {
+              selection_bytes:(if .key == 0 then $group.bytes else 0 end),
+              physical_bundle_size:$group.count
+            }
+        ]
     ' <<<"${scored_json}"
 }
 
@@ -778,8 +847,10 @@ show_policy_summary() {
 }
 
 emit_policy_snapshot() {
-  local scored_json="$1" selected_json="$2" total="$3" selected_hashes snapshot
-  if ! selected_hashes="$(jq -c '[.[].hash]' <<<"${selected_json}" 2>/dev/null)"; then
+  local scored_json="$1" selected_json="$2" total="$3" selected_map snapshot
+  if ! selected_map="$(jq -c '
+    reduce .[] as $item ({}; .[$item.hash] = ($item.selection_bytes // 0))
+  ' <<<"${selected_json}" 2>/dev/null)"; then
     log "AVISO" "nao foi possivel preparar o resumo estruturado; a limpeza continuara"
     return 0
   fi
@@ -788,7 +859,7 @@ emit_policy_snapshot() {
     --arg timestamp "$(date --iso-8601=seconds)" \
     --arg mode "${RUN_MODE}" \
     --argjson total_torrents "${total}" \
-    --argjson selected_hashes "${selected_hashes}" \
+    --argjson selected_map "${selected_map}" \
     --argjson disk_pressure_enabled "${DISK_PRESSURE_ENABLED}" \
     --argjson disk_total_bytes "${DISK_TOTAL_BYTES}" \
     --argjson disk_free_bytes "${DISK_FREE_BYTES}" \
@@ -796,7 +867,7 @@ emit_policy_snapshot() {
     --argjson low_watermark_bytes "${LOW_WATERMARK_BYTES}" \
     --argjson high_watermark_bytes "${HIGH_WATERMARK_BYTES}" \
     --argjson bytes_needed "${BYTES_NEEDED}" '
-      def selected($hash): ($selected_hashes | index($hash)) != null;
+      def selected($hash): $selected_map[$hash] != null;
       def rounded_average($values):
         if ($values | length) > 0
         then (($values | add / length * 100) | round / 100)
@@ -824,13 +895,13 @@ emit_policy_snapshot() {
           upload_speed_bps: ([$torrents[] | (.upspeed // 0)] | add // 0),
           history_ready: ([$torrents[] | select(.history_ready)] | length),
           eligible_torrents: ([$torrents[] | select(.eligible)] | length),
-          selected_torrents: ($selected_hashes | length),
+          selected_torrents: ($selected_map | length),
           selected_logical_bytes: (
             [$torrents[] | select(selected(.hash)) | (.size_bytes // 0)] | add // 0
           ),
           estimated_physical_reclaim_bytes: (
             [$torrents[] | select(selected(.hash)) |
-              (.physical_reclaimable_bytes // .size_bytes // 0)] | add // 0
+              ($selected_map[.hash] // .physical_reclaimable_bytes // .size_bytes // 0)] | add // 0
           ),
           blockers: {
             retention: ([$torrents[] | select(.blockers.retention // false)] | length),
@@ -864,7 +935,7 @@ emit_policy_snapshot() {
                     selected: ([$items[] | select(selected(.hash))] | length),
                     estimated_physical_reclaim_bytes: (
                       [$items[] | select(selected(.hash)) |
-                        (.physical_reclaimable_bytes // .size_bytes // 0)] | add // 0
+                        ($selected_map[.hash] // .physical_reclaimable_bytes // .size_bytes // 0)] | add // 0
                     ),
                     blockers: {
                       retention: ([$items[] | select(.blockers.retention // false)] | length),
@@ -986,7 +1057,7 @@ delete_torrents() {
         event:"torrent_deleted", run_id:$run_id, timestamp:$timestamp,
         name:(.name // ""), category:(.category // ""), size_bytes:(.size_bytes // 0),
         estimated_physical_reclaim_bytes:(
-          if $delete_files then (.physical_reclaimable_bytes // .size_bytes // 0) else 0 end
+          if $delete_files then (.selection_bytes // .physical_reclaimable_bytes // .size_bytes // 0) else 0 end
         )
       }' <<<"${selected_json}")
   emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "${event_time}" \
