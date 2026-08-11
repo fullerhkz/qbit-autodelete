@@ -134,7 +134,11 @@ modo de emergencia, com lote proprio e permissao configuravel para candidatos se
 historico. Em todos os modos, os itens de maior pontuacao sao selecionados ate o espaco
 estimado atingir o alvo, o limite de itens ou o limite de GiB por execucao. Sob
 pressao, caminhos cujos arquivos so possuem blocos mantidos por hardlinks nao contam
-como capacidade recuperavel e nao consomem o lote.
+como capacidade recuperavel isoladamente. Quando todos os torrents gerenciados que
+apontam para o mesmo conjunto de inodes estao elegiveis, eles formam um lote atomico:
+o grupo e removido junto e os blocos fisicos sao contabilizados uma unica vez. Se um
+dos membros estiver protegido por retencao, ratio, tag ou transferencia ativa, o grupo
+inteiro fica fora daquela rodada para nao prometer espaco que continuaria ocupado.
 
 Uma categoria de links do cross-seed pode ser limitada ao modo de emergencia usando
 uma retencao normal deliberadamente impraticavel e uma retencao de emergencia real:
@@ -143,9 +147,11 @@ uma retencao normal deliberadamente impraticavel e uma retencao de emergencia re
 cross-seed-link|87600|1.0|24
 ```
 
-Assim, a limpeza normal nao encerra cross-seeds. Sob emergencia, o estimador ainda
-seleciona apenas os itens cuja remocao realmente libera blocos, como arquivos que
-viraram o ultimo hardlink depois que a origem foi removida. O qBittorrent pode deixar
+Assim, a limpeza normal nao encerra cross-seeds. Sob emergencia, o estimador pode
+selecionar o ultimo hardlink isolado ou o conjunto completo de torrents elegiveis que
+compartilha os mesmos blocos. A menor pontuacao do conjunto define sua prioridade,
+preservando conteudo produtivo mesmo quando um cross-seed associado tem score alto.
+O qBittorrent pode deixar
 arquivos extras sem referencia dentro do `linkDir`; o cross-seed nao remove esses
 orfaos. Use uma ferramenta propria, como `qbit_manage --rem-orphaned`, limitada ao
 `linkDir` e validada primeiro com `--dry-run`.

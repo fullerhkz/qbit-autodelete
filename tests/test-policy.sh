@@ -157,6 +157,48 @@ single_bytes="$(estimate_path_reclaimable_bytes "${reclaim_test_dir}/original")"
 ((single_bytes > 0)) || fail "arquivo sem hardlink deveria liberar blocos"
 ln "${reclaim_test_dir}/original" "${reclaim_test_dir}/link"
 assert_eq "$(estimate_path_reclaimable_bytes "${reclaim_test_dir}/original")" "0" "hardlink nao libera blocos sozinho"
+
+bundle_input="$(jq -cn \
+  --arg original "${reclaim_test_dir}/original" \
+  --arg link "${reclaim_test_dir}/link" '[
+    {
+      hash:"bundle-original", name:"conteudo", category:"Categoria Filmes",
+      content_path:$original, size_bytes:5, cleanup_score:80,
+      eligible:true, history_ready:true
+    },
+    {
+      hash:"bundle-link", name:"conteudo", category:"cross-seed-link",
+      content_path:$link, size_bytes:5, cleanup_score:70,
+      eligible:true, history_ready:true
+    }
+  ]')"
+DISK_PRESSURE_ENABLED=true
+DELETE_FILES=true
+bundle_enriched="$(enrich_reclaimability "${bundle_input}")"
+assert_eq "$(jq -r '.[0].physical_group_member_count' <<<"${bundle_enriched}")" "2" \
+  "grupo de hardlinks reconhecido"
+(( $(jq -r '.[0].physical_group_reclaimable_bytes' <<<"${bundle_enriched}") > 0 )) ||
+  fail "grupo completo deveria liberar blocos fisicos"
+RUN_MODE="emergency"
+BYTES_NEEDED=1073741824
+bundle_selected="$(select_candidates "${bundle_enriched}")"
+assert_eq "$(jq -r 'length' <<<"${bundle_selected}")" "2" \
+  "hardlinks elegiveis devem ser selecionados atomicamente"
+(( $(jq '[.[].selection_bytes] | add // 0' <<<"${bundle_selected}") > 0 )) ||
+  fail "selecao agrupada deveria contabilizar recuperacao fisica"
+RUN_ID="bundle-policy"
+DISK_TOTAL_BYTES=0
+DISK_FREE_BYTES=0
+CRITICAL_WATERMARK_BYTES=0
+LOW_WATERMARK_BYTES=0
+HIGH_WATERMARK_BYTES=0
+bundle_snapshot="$(emit_policy_snapshot "${bundle_enriched}" "${bundle_selected}" 2)"
+bundle_expected="$(jq '[.[].selection_bytes] | add // 0' <<<"${bundle_selected}")"
+grep -Fq "\"estimated_physical_reclaim_bytes\":${bundle_expected}" <<<"${bundle_snapshot}" ||
+  fail "resumo deveria preservar a estimativa fisica do grupo"
+bundle_blocked="$(jq '.[1].eligible=false' <<<"${bundle_enriched}")"
+assert_eq "$(select_candidates "${bundle_blocked}" | jq -r 'length')" "0" \
+  "grupo incompleto nao deve prometer espaco que nao sera liberado"
 rm -rf -- "${reclaim_test_dir}"
 
 # Com 100% como piso, qualquer filesystem real entra em pressao.
