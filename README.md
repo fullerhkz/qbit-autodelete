@@ -166,6 +166,65 @@ real observada no filesystem antes/depois da API. Como o qBittorrent pode exclui
 arquivos depois de responder, `PHYSICAL_MEASURE_TIMEOUT_SECONDS` controla por quanto
 tempo o script acompanha o `df`. Escritas concorrentes ainda podem afetar a medicao.
 
+## Cross-seed, rendimento e modo de pressao (v3.7)
+
+Esta secao descreve os recursos pensados para maximizar o upload dado o disco.
+
+### Grupos de hardlinks e categorias seguidoras
+
+Torrents que compartilham os mesmos arquivos (hardlinks de cross-seed) formam um grupo
+fisico. A selecao agora avalia o grupo inteiro em todos os modos:
+
+- o torrent **pai** (qualquer membro fora de `FOLLOWER_CATEGORIES`) decide: todos os pais
+  precisam passar por retencao, ratio, inatividade, rendimento, historico e score;
+- os **seguidores** (`FOLLOWER_CATEGORIES`, por exemplo `cross-seed-link`) nao tem regra
+  propria. Saem junto com o pai, com o conteudo e os hardlinks, na mesma chamada de exclusao;
+- uma tag protegida (`PROTECTED_TAGS`) em qualquer seguidor veta o grupo inteiro;
+- um seguidor que baixou dados (`downloaded > 0`) protege o grupo por
+  `FOLLOWER_DOWNLOAD_PROTECT_HOURS`, pois um download parcial pode abrir HnR no outro tracker;
+- grupos sem pai no qBittorrent so saem se `FOLLOWER_ORPHAN_HOURS` for maior que zero.
+
+Uma categoria listada em `FOLLOWER_CATEGORIES` ignora qualquer linha propria no arquivo de
+categorias. O resumo de cada rodada informa por que os grupos foram bloqueados
+(`pai_retencao`, `pai_ratio`, `link_protegido`, `sem_recuperacao`, ...).
+
+### Protecao por rendimento
+
+`PROTECT_EFFICIENCY_MIB_PER_GIB_DAY` (0 desliga) impede a selecao de torrents cujo upload
+recente, pela media movel ou pela velocidade instantanea, supera o valor em MiB por GiB por
+dia. Vale em todos os modos. A unica excecao e a emergencia com o disco livre abaixo de
+`YIELD_OVERRIDE_PERCENT_OF_CRITICAL`% do nivel critico, quando nao ha mais nada morto para
+apagar. Sem HnR, o piso de ratio e os prazos longos so mantem conteudo parado; use
+`min_ratio` 0 nas regras e prazos curtos, e deixe o rendimento decidir.
+
+### Reconferencia antes de excluir
+
+Com `REVERIFY_BEFORE_DELETE=true` o script consulta de novo os candidatos imediatamente
+antes de excluir. Tag protegida nova, torrent que voltou a render, force start, torrent que
+deixou de estar completo ou membro ausente retiram o **grupo inteiro** da rodada. Se a API
+falhar, a exclusao fica para a proxima rodada.
+
+### Modo de pressao (`--pressure-gate`)
+
+`qbit-autodelete --pressure-gate` mede so o disco. Fica em silencio quando o espaco livre
+esta acima do nivel baixo, quando outra execucao ocupa o lock ou quando a ultima execucao
+completa foi ha menos de `PRESSURE_GATE_MIN_INTERVAL_SECONDS`. Caso contrario faz uma
+execucao completa. Com a unit `qbit-autodelete-gate.timer` (a cada 5 minutos) a reserva de
+disco pode ser menor, pois a reacao a uma rajada deixa de levar ate 30 minutos.
+
+### Modo sombra e avaliacao
+
+Para validar uma politica sem excluir nada, rode uma segunda instancia com `DRY_RUN=true`,
+`STATE_FILE` e `LOCK_FILE` proprios e outra unit. Cada candidato gera um evento
+`dry_run_candidate` com o contador de upload. Depois de 48 a 72 horas:
+
+```bash
+tools/shadow-report.sh --config /etc/qbit-autodelete-shadow.env --unit qbit-autodelete-shadow.service
+```
+
+O relatorio compara o upload que os candidatos geraram depois de indicados com o upload
+total medido. Saida 0 quando o upload descartavel fica abaixo do limite (1% por padrao).
+
 ## Instalador interativo (recomendado)
 
 O instalador apresenta um menu colorido e nao exige editar o script ou as units.
@@ -332,6 +391,11 @@ sudo systemctl enable --now qbit-autodelete.timer
 systemctl list-timers qbit-autodelete.timer
 journalctl -u qbit-autodelete.service -n 100 --no-pager
 ```
+
+O modelo da unit define `TimeoutStartSec=20min`: uma varredura travada no disco nao bloqueia
+as proximas rodadas em silencio. A prioridade de I/O e `best-effort` baixa; a classe `idle`
+fica sem fatia quando o disco esta ocupado. Para alertar falhas, use `OnFailure=` com uma
+unit propria. O modo de pressao usa `example/qbit-autodelete-gate.service` e `.timer`.
 
 Se o nome da unit do qBittorrent for conhecido, `After=` pode ser adicionado, mas nao e
 obrigatorio: o script ja tenta autenticar novamente quando o cliente ainda esta subindo.

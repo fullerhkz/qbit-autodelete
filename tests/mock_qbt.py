@@ -4,6 +4,7 @@ import sys
 import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -42,9 +43,11 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404)
 
     def do_GET(self):
-        if self.path != "/api/v2/torrents/info":
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/v2/torrents/info":
             self.reply(404)
             return
+        wanted = parse_qs(parsed.query).get("hashes", [""])[0]
         now = int(time.time())
         torrent = {
             "hash": "mockhash",
@@ -68,6 +71,9 @@ class Handler(BaseHTTPRequestHandler):
             "force_start": False,
             "tags": "",
         }
+        if wanted and "mockhash" not in wanted.split("|"):
+            self.reply(200, b"[]", "application/json")
+            return
         self.reply(200, json.dumps([torrent]).encode(), "application/json")
 
 

@@ -8,3 +8,6 @@ Categoria-Filmes|48|1.0|36
 Categoria-Series|72|1.0|48
 Categoria-Cursos|120|1.0|96
 Tracker-Privado|168|2.0|120
+
+# Categorias de cross-seed NAO entram aqui: declare-as em FOLLOWER_CATEGORIES.
+# Elas nao tem retencao propria e acompanham o torrent pai do mesmo conteudo.
