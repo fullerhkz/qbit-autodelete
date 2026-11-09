@@ -755,11 +755,11 @@ enrich_reclaimability() {
            | map(select(length > 1) | map(.h) | unique)) as $links
         | ($with | map({key: .hash, value: .hash}) | from_entries) as $start
         | ($start | until(
-            . as $label | ($links | map(map($label[.]) | unique | length) | all(. == 1));
+            . as $lab | ($links | map(map($lab[.]) | unique | length) | all(. == 1));
             reduce $links[] as $set (.;
               . as $cur | ($set | map($cur[.]) | min) as $low
-              | reduce $set[] as $h (.; .[$h] = $low)))) as $label
-        | reduce ($with | group_by($label[.hash])[]) as $comp ({};
+              | reduce $set[] as $h (.; .[$h] = $low)))) as $lab
+        | reduce ($with | group_by($lab[.hash])[]) as $comp ({};
             ($comp | map(.hash)) as $members
             | ($comp | map(.files[]) | group_by(.ino)
                | map({ino: .[0].ino, nlink: .[0].nlink, blocks: .[0].blocks, names: length})) as $inodes
