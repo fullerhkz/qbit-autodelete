@@ -2,6 +2,7 @@
 Description=Limpeza inteligente de torrents do qBittorrent
 Documentation=https://github.com/fullerhkz/qbit-autodelete
 Wants=network-online.target
+# Opcional: avise quando a rodada falhar, por exemplo OnFailure=qbit-autodelete-failure@%n.service
 After=network-online.target
 
 [Service]
@@ -11,6 +12,11 @@ Group=QBIT_SERVICE_GROUP
 ExecStart=/PATH/TO/qbit-autodelete --config /PATH/TO/qbit-autodelete.env
 UMask=0077
 Nice=10
+# Um find travado no disco nao pode bloquear as proximas rodadas em silencio.
+TimeoutStartSec=20min
+# Prioridade baixa, mas nao ociosa: a classe idle morre de fome com o disco ocupado.
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 NoNewPrivileges=true
 CapabilityBoundingSet=
 PrivateDevices=true

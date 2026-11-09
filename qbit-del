@@ -4,6 +4,10 @@ set -Eeuo pipefail
 VERSION="1.2.0"
 SERVICE_NAME="${QBIT_DEL_SERVICE:-qbit-autodelete.service}"
 TIMER_NAME="${QBIT_DEL_TIMER:-qbit-autodelete.timer}"
+# Timer opcional do modo de pressao (--pressure-gate): tambem pode excluir, entao
+# stop/start/restart precisam trata-lo junto com o timer principal.
+GATE_TIMER_NAME="${QBIT_DEL_GATE_TIMER:-qbit-autodelete-gate.timer}"
+GATE_SERVICE_NAME="${QBIT_DEL_GATE_SERVICE:-qbit-autodelete-gate.service}"
 SYSTEMCTL="${QBIT_DEL_SYSTEMCTL:-systemctl}"
 JOURNALCTL="${QBIT_DEL_JOURNALCTL:-journalctl}"
 
@@ -65,6 +69,13 @@ require_installation() {
   [[ "${QBIT_DEL_SKIP_INSTALL_CHECK:-false}" == "true" ]] && return 0
   unit_loaded "${SERVICE_NAME}" && unit_loaded "${TIMER_NAME}" ||
     die "qbit-autodelete nao esta instalado ou o systemd ainda nao foi recarregado"
+}
+
+stop_gate() {
+  if unit_loaded "${GATE_TIMER_NAME}"; then
+    "${SYSTEMCTL}" stop "${GATE_TIMER_NAME}"
+    "${SYSTEMCTL}" stop "${GATE_SERVICE_NAME}"
+  fi
 }
 
 property() {
@@ -240,12 +251,16 @@ cmd_stop() {
   require_installation
   header "qbit-del stop - parar automacao"
   "${SYSTEMCTL}" stop "${TIMER_NAME}"
+  stop_gate
   "${SYSTEMCTL}" stop "${SERVICE_NAME}"
   ok "Timer parado; nenhuma nova limpeza sera iniciada ate 'qbit-del start'."
 }
 
 start_units() {
   "${SYSTEMCTL}" start "${TIMER_NAME}"
+  if unit_loaded "${GATE_TIMER_NAME}"; then
+    "${SYSTEMCTL}" start "${GATE_TIMER_NAME}"
+  fi
   "${SYSTEMCTL}" start "${SERVICE_NAME}"
 }
 
@@ -267,6 +282,7 @@ cmd_restart() {
   require_installation
   header "qbit-del restart - reiniciar automacao"
   "${SYSTEMCTL}" stop "${TIMER_NAME}"
+  stop_gate
   "${SYSTEMCTL}" stop "${SERVICE_NAME}"
   info "Iniciando novamente..."
   if start_units; then
@@ -298,6 +314,9 @@ cmd_status() {
   printf '  %-24s %s\n' "Inicializacao no boot:" "$(state_badge "${timer_enabled}")"
   printf '  %-24s %s\n' "Ultimo disparo:" "$(format_datetime "${last_trigger}")"
   printf '  %-24s %s\n' "Proximo disparo:" "$(format_datetime "${next_trigger}")"
+  if unit_loaded "${GATE_TIMER_NAME}"; then
+    printf '  %-24s %s\n' "Timer de pressao:" "$(state_badge "$(property "${GATE_TIMER_NAME}" ActiveState)")"
+  fi
 
   printf '\n%s%sULTIMA EXECUCAO%s\n' "${BOLD}" "${CYAN}" "${RESET}"
   line

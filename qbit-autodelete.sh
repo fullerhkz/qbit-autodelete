@@ -3,11 +3,14 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.6.0"
+VERSION="3.7.0"
 
 declare -A RETENTION_HOURS=()
 declare -A EMERGENCY_RETENTION_HOURS=()
 declare -A MIN_RATIOS=()
+declare -A FOLLOWERS=()
+FOLLOWERS_JSON="[]"
+YIELD_OVERRIDE="false"
 COOKIE_JAR=""
 CLI_DRY_RUN=""
 ACTION="run"
@@ -39,6 +42,7 @@ Uso: qbit-autodelete.sh [opcoes]
   -c, --config ARQUIVO  usa outro arquivo de configuracao
       --dry-run         simula esta execucao, sem excluir
       --check-config    valida a configuracao e encerra
+      --pressure-gate   executa so se o disco estiver abaixo do nivel baixo
   -h, --help            mostra esta ajuda
   -v, --version         mostra a versao
 EOF
@@ -58,6 +62,10 @@ parse_args() {
         ;;
       --check-config)
         ACTION="check-config"
+        shift
+        ;;
+      --pressure-gate)
+        ACTION="pressure-gate"
         shift
         ;;
       -h|--help)
@@ -96,6 +104,13 @@ load_config() {
   RATIO_PROTECTION_MAX_HOURS="${RATIO_PROTECTION_MAX_HOURS:-336}"
   EMERGENCY_RATIO_PROTECTION_MAX_HOURS="${EMERGENCY_RATIO_PROTECTION_MAX_HOURS:-${RATIO_PROTECTION_MAX_HOURS}}"
   PROTECTED_TAGS="${PROTECTED_TAGS:-keep,never-delete}"
+  FOLLOWER_CATEGORIES="${FOLLOWER_CATEGORIES:-}"
+  FOLLOWER_DOWNLOAD_PROTECT_HOURS="${FOLLOWER_DOWNLOAD_PROTECT_HOURS:-168}"
+  FOLLOWER_ORPHAN_HOURS="${FOLLOWER_ORPHAN_HOURS:-0}"
+  PROTECT_EFFICIENCY_MIB_PER_GIB_DAY="${PROTECT_EFFICIENCY_MIB_PER_GIB_DAY:-0}"
+  YIELD_OVERRIDE_PERCENT_OF_CRITICAL="${YIELD_OVERRIDE_PERCENT_OF_CRITICAL:-50}"
+  REVERIFY_BEFORE_DELETE="${REVERIFY_BEFORE_DELETE:-true}"
+  PRESSURE_GATE_MIN_INTERVAL_SECONDS="${PRESSURE_GATE_MIN_INTERVAL_SECONDS:-300}"
   SKIP_FORCE_STARTED="${SKIP_FORCE_STARTED:-true}"
   SKIP_ACTIVE_TRANSFERS="${SKIP_ACTIVE_TRANSFERS:-true}"
   MIN_INACTIVE_HOURS="${MIN_INACTIVE_HOURS:-6}"
@@ -145,6 +160,7 @@ load_config() {
   PHYSICAL_MEASURE_TIMEOUT_SECONDS="${PHYSICAL_MEASURE_TIMEOUT_SECONDS:-300}"
   PHYSICAL_MEASURE_INTERVAL_SECONDS="${PHYSICAL_MEASURE_INTERVAL_SECONDS:-5}"
   LOCK_FILE="${LOCK_FILE:-/tmp/qbit-autodelete-${UID}.lock}"
+  RUN_STAMP_FILE="${RUN_STAMP_FILE:-${STATE_FILE}.lastrun}"
 }
 
 validate_bool() {
@@ -204,11 +220,31 @@ load_category_rules() {
     MIN_RATIOS["${category}"]="${min_ratio}"
   done < "${CATEGORY_RULES_FILE}"
 
+  load_followers
   ((${#RETENTION_HOURS[@]} > 0)) || die "nenhuma categoria configurada em ${CATEGORY_RULES_FILE}"
   if [[ "${INCLUDE_NO_CATEGORY}" == "true" ]]; then
     RETENTION_HOURS[""]="${NO_CATEGORY_RETENTION_HOURS}"
     EMERGENCY_RETENTION_HOURS[""]="${NO_CATEGORY_RETENTION_HOURS}"
     MIN_RATIOS[""]="${DEFAULT_MIN_RATIO}"
+  fi
+}
+
+load_followers() {
+  FOLLOWERS=()
+  local item category
+  local -a items=()
+  IFS=',' read -r -a items <<<"${FOLLOWER_CATEGORIES}"
+  for item in "${items[@]}"; do
+    category="$(trim "${item}")"
+    [[ -n "${category}" ]] || continue
+    FOLLOWERS["${category}"]=1
+    # A categoria seguidora nao tem retencao propria: ela acompanha o torrent pai.
+    unset 'RETENTION_HOURS[${category}]' 'EMERGENCY_RETENTION_HOURS[${category}]' 'MIN_RATIOS[${category}]'
+  done
+  if ((${#FOLLOWERS[@]} > 0)); then
+    FOLLOWERS_JSON="$(printf '%s\n' "${!FOLLOWERS[@]}" | jq -Rn '[inputs]')"
+  else
+    FOLLOWERS_JSON="[]"
   fi
 }
 
@@ -226,7 +262,7 @@ validate_config() {
   local bool_name
   for bool_name in DRY_RUN DELETE_FILES ALLOW_INCOMPLETE_DELETE INCLUDE_NO_CATEGORY \
     SKIP_FORCE_STARTED SKIP_ACTIVE_TRANSFERS NORMAL_CLEANUP_ENABLED AGGRESSIVE_WITHOUT_HISTORY \
-    EMERGENCY_WITHOUT_HISTORY \
+    EMERGENCY_WITHOUT_HISTORY REVERIFY_BEFORE_DELETE \
     DISK_PRESSURE_ENABLED CURL_INSECURE; do
     validate_bool "${bool_name}"
   done
@@ -239,7 +275,9 @@ validate_config() {
     SCORE_LOW_UPLOAD_WEIGHT SCORE_SIZE_WEIGHT SCORE_INACTIVITY_WEIGHT \
     SCORE_COMPETITION_WEIGHT SIZE_FULL_SCORE_GB INACTIVITY_FULL_SCORE_HOURS HISTORY_MIN_SAMPLES \
     HISTORY_MIN_HOURS HISTORY_MIN_SAMPLE_SECONDS LOW_WATERMARK_GB HIGH_WATERMARK_GB \
-    CRITICAL_WATERMARK_GB CONNECT_TIMEOUT REQUEST_TIMEOUT LOGIN_RETRIES; do
+    CRITICAL_WATERMARK_GB CONNECT_TIMEOUT REQUEST_TIMEOUT LOGIN_RETRIES \
+    FOLLOWER_DOWNLOAD_PROTECT_HOURS FOLLOWER_ORPHAN_HOURS YIELD_OVERRIDE_PERCENT_OF_CRITICAL \
+    PRESSURE_GATE_MIN_INTERVAL_SECONDS; do
     validate_uint "${uint_name}"
   done
   validate_uint PHYSICAL_MEASURE_TIMEOUT_SECONDS
@@ -253,6 +291,8 @@ validate_config() {
   validate_range_0_100 UPLOAD_EWMA_ALPHA_PERCENT
   validate_decimal DEFAULT_MIN_RATIO
   validate_decimal UPLOAD_EFFICIENCY_FULL_MIB_PER_GIB_DAY
+  validate_decimal PROTECT_EFFICIENCY_MIB_PER_GIB_DAY
+  validate_range_0_100 YIELD_OVERRIDE_PERCENT_OF_CRITICAL
 
   ((MAX_DELETE_PER_RUN > 0)) || die "MAX_DELETE_PER_RUN deve ser maior que zero"
   ((EMERGENCY_MAX_DELETE_PER_RUN > 0)) ||
@@ -332,13 +372,14 @@ cleanup() {
 
 login_qbittorrent() {
   local attempt response user_encoded pass_encoded
-  user_encoded="$(jq -rn --arg value "${QBT_USER}" '$value|@uri')"
-  pass_encoded="$(jq -rn --arg value "${QBT_PASS}" '$value|@uri')"
+  # Credenciais seguem por ambiente do processo (nao aparecem em /proc/PID/cmdline).
+  user_encoded="$(QBIT_AD_VALUE="${QBT_USER}" jq -rn 'env.QBIT_AD_VALUE|@uri')"
+  pass_encoded="$(QBIT_AD_VALUE="${QBT_PASS}" jq -rn 'env.QBIT_AD_VALUE|@uri')"
 
   for ((attempt = 1; attempt <= LOGIN_RETRIES; attempt++)); do
     response="$({
       printf 'username=%s&password=%s' "${user_encoded}" "${pass_encoded}"
-    } | curl "${CURL_COMMON[@]}" -c "${COOKIE_JAR}" -X POST \
+    } | curl "${CURL_COMMON[@]}" --retry 0 -c "${COOKIE_JAR}" -X POST \
       -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- \
       "${QBT_URL}/api/v2/auth/login" 2>/dev/null || true)"
     if [[ "${response}" == "Ok." ]]; then
@@ -387,6 +428,10 @@ score_torrents() {
     --argjson history "${state_json}" \
     --arg mode "${RUN_MODE:-normal}" \
     --arg protected_tags "${PROTECTED_TAGS}" \
+    --argjson followers "${FOLLOWERS_JSON}" \
+    --argjson follower_download_protect_hours "${FOLLOWER_DOWNLOAD_PROTECT_HOURS}" \
+    --argjson protect_efficiency "${PROTECT_EFFICIENCY_MIB_PER_GIB_DAY}" \
+    --argjson yield_override "${YIELD_OVERRIDE}" \
     --argjson allow_incomplete "${ALLOW_INCOMPLETE_DELETE}" \
     --argjson skip_forced "${SKIP_FORCE_STARTED}" \
     --argjson skip_active "${SKIP_ACTIVE_TRANSFERS}" \
@@ -421,8 +466,9 @@ score_torrents() {
       ($protected_tags | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))) as $protected
       | map(
           (.category // "") as $category
-          | select($rules[$category] != null)
-          | $rules[$category] as $rule
+          | (($followers | index($category)) != null) as $is_follower
+          | select($rules[$category] != null or $is_follower)
+          | ($rules[$category] // {retention_hours: 0, emergency_retention_hours: 0, min_ratio: 0}) as $rule
           | (if $mode == "emergency"
              then ($rule.emergency_retention_hours // $rule.retention_hours)
              else $rule.retention_hours end) as $effective_retention
@@ -474,6 +520,12 @@ score_torrents() {
               ($age_hours < $effective_ratio_protection_max_hours))) as $ratio_protected
           | (clean_tags) as $tags
           | (any($tags[]; . as $tag | $protected | index($tag))) as $protected_by_tag
+          | (if $size_gb > 0 then ((.upspeed // 0) * 86400 / 1048576 / $size_gb) else 0 end) as $instant_efficiency
+          | ([$efficiency, $instant_efficiency] | max) as $yield_efficiency
+          | (($protect_efficiency > 0) and ($yield_efficiency >= $protect_efficiency)
+             and ($yield_override | not)) as $yield_protected
+          | (($follower_download_protect_hours > 0) and ((.downloaded // 0) > 0)
+             and ($age_hours < $follower_download_protect_hours)) as $downloaded_protected
           | (((.upspeed // 0) > 0) or ((.dlspeed // 0) > 0) or
              ((.state // "") | test("^(checking|moving|allocating)"))) as $active
           | (($allow_incomplete | not) and ($complete | not)) as $blocked_incomplete
@@ -481,6 +533,7 @@ score_torrents() {
           | ($inactive_hours < $effective_min_inactive) as $blocked_inactivity
           | ($ratio_protected) as $blocked_ratio
           | ($protected_by_tag) as $blocked_tag
+          | ($yield_protected and ($is_follower | not)) as $blocked_yield
           | ($skip_forced and (.force_start // false)) as $blocked_forced
           | ($skip_active and $active) as $blocked_active
           | (((1 - capped_ratio($efficiency; $efficiency_full)) * $low_upload_weight)
@@ -504,6 +557,10 @@ score_torrents() {
               swarm_leechers: $leechers,
               recent_upload_bph: ($ewma_upload_bph | floor),
               upload_efficiency_mib_per_gib_day: (($efficiency * 100) | round / 100),
+              yield_mib_per_gib_day: (($yield_efficiency * 100) | round / 100),
+              is_follower: $is_follower,
+              follower_veto: ($protected_by_tag or $downloaded_protected),
+              downloaded_protected: $downloaded_protected,
               history_samples: $samples,
               history_observed_hours: (($observed_seconds / 3600 * 100) | round / 100),
               history_ready: $history_ready,
@@ -516,6 +573,7 @@ score_torrents() {
                 inactivity: $blocked_inactivity,
                 ratio: $blocked_ratio,
                 protected_tag: $blocked_tag,
+                yield: $blocked_yield,
                 forced: $blocked_forced,
                 active_transfer: $blocked_active
               },
@@ -527,11 +585,13 @@ score_torrents() {
                 observed_seconds: $observed_seconds
               },
               eligible: (
-                ($blocked_incomplete | not)
+                ($is_follower | not)
+                and ($blocked_incomplete | not)
                 and ($blocked_retention | not)
                 and ($blocked_inactivity | not)
                 and ($blocked_ratio | not)
                 and ($blocked_tag | not)
+                and ($blocked_yield | not)
                 and ($blocked_forced | not)
                 and ($blocked_active | not)
               )
@@ -589,6 +649,7 @@ choose_mode() {
   LOW_WATERMARK_BYTES=0
   HIGH_WATERMARK_BYTES=0
   CRITICAL_WATERMARK_BYTES=0
+  YIELD_OVERRIDE="false"
 
   [[ "${DISK_PRESSURE_ENABLED}" == "true" ]] || return 0
 
@@ -607,6 +668,13 @@ choose_mode() {
     RUN_MODE="emergency"
   elif ((DISK_FREE_BYTES < LOW_WATERMARK_BYTES)); then
     RUN_MODE="aggressive"
+  fi
+
+  # Torrents que ainda rendem upload so entram na selecao quando o disco esta
+  # abaixo de uma fracao do nivel critico, isto e, quando nao ha mais nada morto.
+  if [[ "${RUN_MODE}" == "emergency" ]] &&
+    ((DISK_FREE_BYTES * 100 < CRITICAL_WATERMARK_BYTES * YIELD_OVERRIDE_PERCENT_OF_CRITICAL)); then
+    YIELD_OVERRIDE="true"
   fi
 
   if [[ "${RUN_MODE}" != "normal" ]]; then
@@ -639,14 +707,20 @@ estimate_path_reclaimable_bytes() {
   printf '0'
 }
 
+# Agrupa os torrents por componente conectado: dois torrents pertencem ao mesmo grupo
+# quando compartilham ao menos um inode (hardlink de cross-seed), mesmo que um deles
+# use so um subconjunto dos arquivos do outro. O espaco liberavel de um grupo e a soma
+# dos arquivos cujos nomes (links) estao todos dentro dele.
 enrich_reclaimability() {
-  local scored_json="$1" mapping hash encoded_path path stats signature max_links bytes
-  if [[ "${DISK_PRESSURE_ENABLED}" != "true" || "${DELETE_FILES}" != "true" ]]; then
+  local scored_json="$1" mapping hash encoded_path path
+  if [[ "${DELETE_FILES}" != "true" ||
+    ( "${DISK_PRESSURE_ENABLED}" != "true" && "${FOLLOWERS_JSON}" == "[]" ) ]]; then
     jq -c 'map(. + {
       physical_reclaimable_bytes:null,
       physical_reclaim_estimated:false,
       physical_group_key:null,
       physical_group_member_count:1,
+      physical_group_complete:null,
       physical_group_reclaimable_bytes:null
     })' \
       <<<"${scored_json}"
@@ -656,44 +730,53 @@ enrich_reclaimability() {
   mapping="$(
     while IFS=$'\t' read -r hash encoded_path; do
       path="$(printf '%s' "${encoded_path}" | base64 --decode 2>/dev/null || true)"
-      stats=""
+      local stats=""
       if [[ -f "${path}" ]]; then
         stats="$(stat -c '%d:%i %h %b' -- "${path}" 2>/dev/null || true)"
       elif [[ -d "${path}" ]]; then
         stats="$(find "${path}" -xdev -type f -printf '%D:%i %n %b\n' 2>/dev/null |
           sort -k1,1 -u)"
       fi
-
       if [[ -n "${stats}" ]]; then
-        signature="$(awk '{print $1}' <<<"${stats}" | sha256sum | awk '{print $1}')"
-        read -r max_links bytes < <(awk '
-          {if ($2 > max_links) max_links=$2; blocks += $3}
-          END {printf "%d %.0f\n", max_links, blocks * 512}
-        ' <<<"${stats}")
-        printf '%s\t%s\t%s\t%s\n' "${hash}" "${signature}" "${max_links:-0}" "${bytes:-0}"
+        awk -v hash="${hash}" '{printf "%s\t%s\t%s\t%s\n", hash, $1, $2, $3}' <<<"${stats}"
       else
         printf '%s\t\t0\t0\n' "${hash}"
       fi
     done < <(jq -r '.[] | [(.hash // ""), ((.content_path // "") | @base64)] | @tsv' <<<"${scored_json}") |
       jq -Rn '
         [inputs | split("\t") | {
-          hash:.[0], signature:.[1], max_links:(.[2] | tonumber), bytes:(.[3] | tonumber)
-        }] as $rows
-        | reduce ($rows | map(select(.signature != "")) | group_by(.signature)[]) as $group
-            ({};
-              ($group | length) as $members
-              | ($group | map(.max_links) | max // 0) as $required_links
-              | ($group | map(.bytes) | max // 0) as $group_bytes
-              | reduce $group[] as $item (.;
-                  .[$item.hash] = {
-                    key:$item.signature,
-                    member_count:$members,
-                    reclaimable_bytes:(if $members >= $required_links then $group_bytes else 0 end),
-                    individual_reclaimable_bytes:(if $item.max_links <= 1 then $item.bytes else 0 end)
-                  }))
-        | reduce ($rows[] | select(.signature == "")) as $item (.;
+          hash:.[0], ino:.[1], nlink:(.[2] | tonumber), blocks:(.[3] | tonumber)
+        }] as $lines
+        | ($lines | group_by(.hash)
+           | map({hash: .[0].hash, files: (map(select(.ino != "")) | unique_by(.ino))})) as $rows
+        | ($rows | map(select(.files | length > 0))) as $with
+        # inodes referenciados por 2 ou mais torrents ligam os torrents entre si
+        | ($with | map(.hash as $h | .files[] | {ino, h: $h}) | group_by(.ino)
+           | map(select(length > 1) | map(.h) | unique)) as $links
+        | ($with | map({key: .hash, value: .hash}) | from_entries) as $start
+        | ($start | until(
+            . as $lab | ($links | map(map($lab[.]) | unique | length) | all(. == 1));
+            reduce $links[] as $set (.;
+              . as $cur | ($set | map($cur[.]) | min) as $low
+              | reduce $set[] as $h (.; .[$h] = $low)))) as $lab
+        | reduce ($with | group_by($lab[.hash])[]) as $comp ({};
+            ($comp | map(.hash)) as $members
+            | ($comp | map(.files[]) | group_by(.ino)
+               | map({ino: .[0].ino, nlink: .[0].nlink, blocks: .[0].blocks, names: length})) as $inodes
+            | ((($inodes | map(select(.names >= .nlink) | .blocks) | add) // 0) * 512) as $freed
+            | ($inodes | all(.names >= .nlink)) as $complete
+            | ("grp:" + ($members | min)) as $key
+            | reduce $comp[] as $row (.;
+                .[$row.hash] = {
+                  key: $key, member_count: ($members | length),
+                  complete: $complete, reclaimable_bytes: $freed,
+                  individual_reclaimable_bytes:
+                    ((($row.files | map(select(.nlink <= 1) | .blocks) | add) // 0) * 512)
+                }))
+        | reduce ($rows[] | select(.files | length == 0)) as $item (.;
             .[$item.hash] = {
-              key:null, member_count:1, reclaimable_bytes:0, individual_reclaimable_bytes:0
+              key: null, member_count: 1, complete: false,
+              reclaimable_bytes: 0, individual_reclaimable_bytes: 0
             })
       '
   )"
@@ -704,13 +787,99 @@ enrich_reclaimability() {
       physical_reclaim_estimated: true,
       physical_group_key: ($mapping[.hash].key // null),
       physical_group_member_count: ($mapping[.hash].member_count // 1),
+      physical_group_complete: ($mapping[.hash].complete // false),
       physical_group_reclaimable_bytes: ($mapping[.hash].reclaimable_bytes // 0)
     })
   ' <<<"${scored_json}"
 }
 
-select_candidates() {
-  local scored_json="$1"
+# Programa jq unico para selecao e diagnostico. Cada grupo fisico (hardlinks
+# compartilhados) e avaliado como um conjunto: o torrent pai decide e os
+# seguidores (cross-seed) acompanham, mantendo apenas vetos explicitos.
+SELECT_JQ='
+  def parent_ok:
+    .eligible and (.history_ready or ($mode != "normal" and $without_history))
+    and (.cleanup_score >= $threshold);
+  def failing_reason:
+    if (.blockers.protected_tag // false) then "tag"
+    elif (.blockers.yield // false) then "rendimento"
+    elif (.blockers.forced // false) then "forcado"
+    elif (.blockers.active_transfer // false) then "transferencia"
+    elif (.blockers.incomplete // false) then "incompleto"
+    elif (.blockers.retention // false) then "retencao"
+    elif (.blockers.ratio // false) then "ratio"
+    elif (.blockers.inactivity // false) then "inatividade"
+    elif ((.history_ready or ($mode != "normal" and $without_history)) | not) then "historico"
+    elif (.cleanup_score < $threshold) then "score"
+    else "outro" end;
+  def gkey: (.physical_group_key // ("torrent:" + (.hash // "")));
+  def follower: (.is_follower // false);
+  [group_by(gkey)[]
+    | . as $all
+    | ($all | map(select(follower | not))) as $parents
+    | ($all | map(select(follower))) as $followers
+    | (if ($parents | length) == 0 then
+         # Orfao so quando todos os nomes do arquivo estao no grupo: um hardlink fora
+         # dele (rTorrent, categoria nao gerenciada) indica um pai protegido.
+         if $orphan_hours > 0 and ($all[0].physical_group_key != null)
+            and (($all[0].physical_reclaim_estimated // false) and ($all[0].physical_group_complete // false))
+            and all($followers[]; (.age_hours >= $orphan_hours) and ((.follower_veto // false) | not))
+         then {kind: "cand", reason: "orfao", members: $all, rank: 100}
+         else {kind: "blocked", reason: (if $orphan_hours > 0 then "orfao_aguardando" else "orfao_ignorado" end)} end
+       elif ($parents | map(parent_ok) | all | not) then
+         {kind: "blocked",
+          reason: ("pai_" + ([$parents[] | select(parent_ok | not)] | sort_by(.cleanup_score) | reverse | .[0] | failing_reason))}
+       elif ($followers | map(.follower_veto // false) | any) then
+         {kind: "blocked", reason: "link_protegido"}
+       else {kind: "cand", reason: "pai", members: $all,
+             rank: ($parents | map(.cleanup_score) | min // 0)} end) as $decision
+    | if $decision.kind == "blocked" then $decision
+      else
+        ($decision.members) as $members
+        | (if $mode == "normal" then
+             (if ($members[0].physical_reclaim_estimated // false)
+              then ($members[0].physical_group_reclaimable_bytes // 0)
+              else ([$members[] | (.size_bytes // 0)] | max // 0) end)
+           elif ($members[0].physical_reclaim_estimated // false)
+           then ($members[0].physical_group_reclaimable_bytes //
+                 $members[0].physical_reclaimable_bytes // 0)
+           else ($members[0].physical_group_reclaimable_bytes //
+                 $members[0].physical_reclaimable_bytes // $members[0].size_bytes // 0)
+           end) as $group_bytes
+        | if ($mode != "normal") and ($group_bytes <= 0)
+          then {kind: "blocked", reason: "sem_recuperacao"}
+          else {kind: "cand", reason: $decision.reason,
+                items: ($members | sort_by(.cleanup_score, .size_bytes) | reverse),
+                count: ($members | length), bytes: $group_bytes, rank: $decision.rank} end
+      end
+  ] as $groups
+  | ([$groups[] | select(.kind == "cand")] | sort_by(.rank, .bytes) | reverse
+     | reduce .[] as $group
+         ({items: [], rest: [], bytes: 0};
+           if (((.items | map(.count) | add // 0) + $group.count) > $max_count)
+              or ($wanted_bytes > 0 and .bytes >= $wanted_bytes)
+              or ($max_reclaim_bytes > 0 and .bytes >= $max_reclaim_bytes)
+           then .rest += [$group]
+           else .items += [$group] | .bytes += $group.bytes
+           end)) as $chosen
+  | if $want == "diag" then
+      {selected_groups: ($chosen.items | length),
+       cut_by_limit: ($chosen.rest | length),
+       blocked: ([$groups[] | select(.kind == "blocked") | .reason]
+                 | group_by(.) | map({key: .[0], value: length}) | from_entries)}
+    else
+      [$chosen.items[]
+        | . as $group
+        | $group.items | to_entries[]
+        | .value + {
+            selection_bytes: (if .key == 0 then $group.bytes else 0 end),
+            physical_bundle_size: $group.count
+          }]
+    end
+'
+
+_select_run() {
+  local scored_json="$1" want="$2"
   local threshold bytes_limit without_history max_count max_reclaim_gb
   case "${RUN_MODE}" in
     emergency)
@@ -733,7 +902,10 @@ select_candidates() {
       without_history="false"
       max_count="${MAX_DELETE_PER_RUN}"
       max_reclaim_gb="${MAX_RECLAIM_GB_PER_RUN}"
-      [[ "${NORMAL_CLEANUP_ENABLED}" == "true" ]] || { printf '[]'; return 0; }
+      if [[ "${NORMAL_CLEANUP_ENABLED}" != "true" ]]; then
+        [[ "${want}" == "diag" ]] && printf '{"selected_groups":0,"cut_by_limit":0,"blocked":{}}' || printf '[]'
+        return 0
+      fi
       ;;
   esac
 
@@ -741,57 +913,21 @@ select_candidates() {
   jq -c \
     --argjson threshold "${threshold}" \
     --arg mode "${RUN_MODE}" \
+    --arg want "${want}" \
     --argjson without_history "${without_history}" \
     --argjson max_count "${max_count}" \
     --argjson wanted_bytes "${bytes_limit}" \
-    --argjson max_reclaim_bytes "${max_reclaim_bytes}" '
-      def qualified:
-        select(.eligible)
-        | select(.history_ready or ($mode != "normal" and $without_history))
-        | select(.cleanup_score >= $threshold);
-      def group_key:
-        if $mode == "normal" then ("torrent:" + (.hash // ""))
-        else (.physical_group_key // ("torrent:" + (.hash // ""))) end;
-      def required_members:
-        if $mode == "normal" then 1 else (.physical_group_member_count // 1) end;
-      [group_by(group_key)[]
-        | . as $all_members
-        | [$all_members[] | qualified] as $members
-        | select(($members | length) == ($all_members[0] | required_members))
-        | (if $mode == "normal"
-           then ($members[0].size_bytes // 0)
-           elif ($members[0].physical_reclaim_estimated // false)
-           then ($members[0].physical_group_reclaimable_bytes //
-                 $members[0].physical_reclaimable_bytes // 0)
-           else ($members[0].physical_group_reclaimable_bytes //
-                 $members[0].physical_reclaimable_bytes // $members[0].size_bytes // 0)
-           end) as $group_bytes
-        | select(($mode == "normal") or ($group_bytes > 0))
-        | {
-            items:($members | sort_by(.cleanup_score, .size_bytes) | reverse),
-            count:($members | length),
-            bytes:$group_bytes,
-            rank:($members | map(.cleanup_score) | min // 0)
-          }
-      ]
-      | sort_by(.rank, .bytes) | reverse
-      | reduce .[] as $group
-          ({items: [], bytes: 0};
-            if (((.items | map(.count) | add // 0) + $group.count) > $max_count)
-               or ($wanted_bytes > 0 and .bytes >= $wanted_bytes)
-               or ($max_reclaim_bytes > 0 and .bytes >= $max_reclaim_bytes)
-            then .
-            else .items += [$group] | .bytes += $group.bytes
-            end)
-      | [.items[]
-          | . as $group
-          | $group.items | to_entries[]
-          | .value + {
-              selection_bytes:(if .key == 0 then $group.bytes else 0 end),
-              physical_bundle_size:$group.count
-            }
-        ]
-    ' <<<"${scored_json}"
+    --argjson max_reclaim_bytes "${max_reclaim_bytes}" \
+    --argjson orphan_hours "${FOLLOWER_ORPHAN_HOURS}" \
+    "${SELECT_JQ}" <<<"${scored_json}"
+}
+
+select_candidates() {
+  _select_run "$1" select
+}
+
+explain_selection() {
+  _select_run "$1" diag
 }
 
 human_gib() {
@@ -800,7 +936,7 @@ human_gib() {
 
 show_policy_summary() {
   local scored_json="$1" selected_json="$2" total="$3"
-  local managed eligible history_ready selected planned planned_physical blockers
+  local managed eligible history_ready selected planned planned_physical blockers diagnostics followers
   managed="$(jq 'length' <<<"${scored_json}")"
   eligible="$(jq '[.[] | select(.eligible)] | length' <<<"${scored_json}")"
   history_ready="$(jq '[.[] | select(.history_ready)] | length' <<<"${scored_json}")"
@@ -820,13 +956,21 @@ show_policy_summary() {
       ["ratio", blocked("ratio")],
       ["transferencia", blocked("active_transfer")],
       ["tag", blocked("protected_tag")],
+      ["rendimento", blocked("yield")],
       ["forcado", blocked("forced")],
       ["incompleto", blocked("incomplete")]
     ]
     | map("\(.[0])=\(.[1]|length)/\(([.[1][] | .size_bytes] | add // 0) / 1073741824 * 10 | round / 10)GiB")
     | join("; ")
   ' <<<"${scored_json}")"
-  log "INFO" "bloqueios (podem se sobrepor): ${blockers}; categorias_nao_listadas=$((total - managed))"
+  followers="$(jq '[.[] | select(.is_follower // false)] | length' <<<"${scored_json}")"
+  log "INFO" "bloqueios (podem se sobrepor): ${blockers}; categorias_nao_listadas=$((total - managed)); seguidores=${followers}"
+  diagnostics="$(explain_selection "${scored_json}" 2>/dev/null | jq -r '
+    "grupos: selecionados=\(.selected_groups); cortados_pelo_limite=\(.cut_by_limit); bloqueados: " +
+    (if (.blocked | length) == 0 then "nenhum"
+     else (.blocked | to_entries | sort_by(-.value) | map("\(.key)=\(.value)") | join("; ")) end)
+  ' 2>/dev/null || true)"
+  [[ -z "${diagnostics}" ]] || log "INFO" "${diagnostics}"
 
   if ((selected > 0)); then
     local list_limit=5
@@ -893,6 +1037,8 @@ emit_policy_snapshot() {
           managed_size_bytes: ([$torrents[] | (.size_bytes // 0)] | add // 0),
           active_torrents: ([$torrents[] | select(.is_active_transfer)] | length),
           upload_speed_bps: ([$torrents[] | (.upspeed // 0)] | add // 0),
+          uploaded_bytes_total: ([$torrents[] | (.uploaded // 0)] | add // 0),
+          follower_torrents: ([$torrents[] | select(.is_follower // false)] | length),
           history_ready: ([$torrents[] | select(.history_ready)] | length),
           eligible_torrents: ([$torrents[] | select(.eligible)] | length),
           selected_torrents: ($selected_map | length),
@@ -909,6 +1055,7 @@ emit_policy_snapshot() {
             ratio: ([$torrents[] | select(.blockers.ratio // false)] | length),
             active_transfer: ([$torrents[] | select(.blockers.active_transfer // false)] | length),
             protected_tag: ([$torrents[] | select(.blockers.protected_tag // false)] | length),
+            yield: ([$torrents[] | select(.blockers.yield // false)] | length),
             forced: ([$torrents[] | select(.blockers.forced // false)] | length),
             incomplete: ([$torrents[] | select(.blockers.incomplete // false)] | length)
           },
@@ -981,6 +1128,60 @@ emit_policy_snapshot() {
   emit_event "${snapshot}"
 }
 
+# Reconfere os candidatos imediatamente antes de excluir: tags, rendimento atual
+# e conclusao podem ter mudado durante a varredura. Um grupo so e excluido inteiro.
+reverify_selection() {
+  local selected_json="$1" count hashes response filtered
+  count="$(jq 'length' <<<"${selected_json}")"
+  if ((count == 0)) || [[ "${REVERIFY_BEFORE_DELETE}" != "true" ]]; then
+    printf '%s' "${selected_json}"
+    return 0
+  fi
+  hashes="$(jq -r '.[].hash' <<<"${selected_json}" | paste -sd'|' -)"
+  if ! response="$(curl "${CURL_COMMON[@]}" -b "${COOKIE_JAR}" -G \
+    --data-urlencode "hashes=${hashes}" "${QBT_URL}/api/v2/torrents/info" 2>/dev/null)" ||
+    ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"${response}"; then
+    log "AVISO" "nao foi possivel reconferir os candidatos; exclusao adiada para a proxima rodada" >&2
+    printf '[]'
+    return 0
+  fi
+  filtered="$(jq -c \
+    --argjson current "${response}" \
+    --arg protected_tags "${PROTECTED_TAGS}" \
+    --argjson skip_forced "${SKIP_FORCE_STARTED}" \
+    --argjson allow_incomplete "${ALLOW_INCOMPLETE_DELETE}" \
+    --argjson protect_efficiency "${PROTECT_EFFICIENCY_MIB_PER_GIB_DAY}" \
+    --argjson yield_override "${YIELD_OVERRIDE}" '
+      def tags_of: ((.tags // "") | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)));
+      def gkey: (.physical_group_key // ("torrent:" + (.hash // "")));
+      ($protected_tags | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))) as $protected
+      | ($current | map({key: .hash, value: .}) | from_entries) as $now
+      | (map(select(
+          ($now[.hash]) as $cur
+          | ($cur == null)
+          or (($cur | tags_of) as $tags | any($tags[]; . as $t | $protected | index($t)))
+          or ((.is_follower // false | not) and (
+                ($skip_forced and ($cur.force_start // false))
+                or (($allow_incomplete | not) and (($cur.progress // 0) < 0.9999))
+                or (($protect_efficiency > 0) and ($yield_override | not)
+                    and ((.size_bytes // 0) > 0)
+                    and ((($cur.upspeed // 0) * 86400 / 1048576 / ((.size_bytes // 1) / 1073741824))
+                         >= $protect_efficiency))))
+        ) | gkey)) as $drop_keys
+      | map(select(gkey as $k | ($drop_keys | index($k)) == null))
+    ' <<<"${selected_json}")" || {
+    log "AVISO" "falha ao reconferir os candidatos; exclusao adiada para a proxima rodada" >&2
+    printf '[]'
+    return 0
+  }
+  local kept
+  kept="$(jq 'length' <<<"${filtered}")"
+  if ((kept < count)); then
+    log "INFO" "reconferencia retirou $((count - kept)) de ${count} candidato(s) (grupos inteiros) por mudanca de estado" >&2
+  fi
+  printf '%s' "${filtered}"
+}
+
 delete_torrents() {
   local selected_json="$1" count hashes response planned_bytes estimated_physical_bytes
   local released_bytes event_time item free_before=0 free_after=0 measurement_available=false
@@ -1000,6 +1201,17 @@ delete_torrents() {
 
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "DRY-RUN" "nenhuma exclusao executada"
+    while IFS= read -r item; do
+      emit_event "${item}"
+    done < <(jq -c --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
+      --arg mode "${RUN_MODE}" '
+        .[] | {
+          event:"dry_run_candidate", run_id:$run_id, timestamp:$timestamp, mode:$mode,
+          hash:.hash, name:(.name // ""), category:(.category // ""),
+          size_bytes:(.size_bytes // 0), uploaded_bytes:(.uploaded // 0),
+          score:(.cleanup_score // 0), yield_mib_per_gib_day:(.yield_mib_per_gib_day // 0),
+          is_follower:(.is_follower // false)
+        }' <<<"${selected_json}")
     emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
       --argjson planned_count "${count}" --argjson planned_bytes "${planned_bytes}" \
       --argjson estimated_physical_bytes "${estimated_physical_bytes}" \
@@ -1073,6 +1285,26 @@ delete_torrents() {
       physical_measurement_available:$measurement_available}')"
 }
 
+# O modo --pressure-gate roda em intervalos curtos: sai em silencio quando o
+# disco esta confortavel, quando outra execucao ocupa o lock ou quando a ultima
+# execucao completa foi recente.
+pressure_gate_precheck() {
+  load_config
+  validate_config
+  CONFIG_LOADED="true"
+  [[ "${DISK_PRESSURE_ENABLED}" == "true" ]] || exit 0
+  choose_mode
+  [[ "${RUN_MODE}" != "normal" ]] || exit 0
+  if [[ -f "${RUN_STAMP_FILE}" ]]; then
+    local age=$(($(date +%s) - $(stat -c %Y -- "${RUN_STAMP_FILE}" 2>/dev/null || echo 0)))
+    ((age >= PRESSURE_GATE_MIN_INTERVAL_SECONDS)) || exit 0
+  fi
+  exec 8>"${LOCK_FILE}"
+  flock -n 8 || exit 0
+  flock -u 8
+  exec 8>&-
+}
+
 main() {
   parse_args "$@"
 
@@ -1083,14 +1315,21 @@ main() {
     return 0
   fi
 
+  CONFIG_LOADED="false"
+  if [[ "${ACTION}" == "pressure-gate" ]]; then
+    pressure_gate_precheck
+  fi
+
   RUN_ID="$(date +%s)-$$-${RANDOM}"
   if command -v jq >/dev/null 2>&1; then
     emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
       --arg version "${VERSION}" \
       '{event:"run_started", run_id:$run_id, timestamp:$timestamp, version:$version}')"
   fi
-  load_config
-  validate_config
+  if [[ "${CONFIG_LOADED}" != "true" ]]; then
+    load_config
+    validate_config
+  fi
   setup_runtime
   log "INFO" "qbit-autodelete ${VERSION} iniciado; dry_run=${DRY_RUN}"
   emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
@@ -1112,7 +1351,9 @@ main() {
   save_state "${scored_json}" "${now_epoch}" ||
     log "AVISO" "historico nao atualizado nesta execucao"
   emit_policy_snapshot "${scored_json}" "${selected_json}" "$(jq 'length' <<<"${raw_json}")"
+  selected_json="$(reverify_selection "${selected_json}")"
   delete_torrents "${selected_json}"
+  touch -- "${RUN_STAMP_FILE}" 2>/dev/null || true
   emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" \
     '{event:"run_completed", run_id:$run_id, timestamp:$timestamp, success:true}')"
   log "INFO" "execucao concluida"

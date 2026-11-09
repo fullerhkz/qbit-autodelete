@@ -59,6 +59,7 @@ status_output="$(env "${COMMON_ENV[@]}" "${TEST_ROOT}/qbit-del" status)"
 assert_output "${status_output}" "Timer:                   active"
 assert_output "${status_output}" "concluida com sucesso"
 assert_output "${status_output}" "Proximo disparo:"
+assert_output "${status_output}" "Timer de pressao:"
 
 : > "${CALLS_FILE}"
 env "${COMMON_ENV[@]}" "${TEST_ROOT}/qbit-del" run >/dev/null
@@ -68,11 +69,14 @@ assert_call "start qbit-autodelete.service"
 env "${COMMON_ENV[@]}" "${TEST_ROOT}/qbit-del" stop >/dev/null
 assert_call "stop qbit-autodelete.timer"
 assert_call "stop qbit-autodelete.service"
+assert_call "stop qbit-autodelete-gate.timer"
+assert_call "stop qbit-autodelete-gate.service"
 
 : > "${CALLS_FILE}"
 env "${COMMON_ENV[@]}" "${TEST_ROOT}/qbit-del" start >/dev/null
 assert_call "start qbit-autodelete.timer"
 assert_call "start qbit-autodelete.service"
+assert_call "start qbit-autodelete-gate.timer"
 
 : > "${CALLS_FILE}"
 env "${COMMON_ENV[@]}" "${TEST_ROOT}/qbit-del" restart >/dev/null
