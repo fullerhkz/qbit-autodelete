@@ -172,8 +172,11 @@ Esta secao descreve os recursos pensados para maximizar o upload dado o disco.
 
 ### Grupos de hardlinks e categorias seguidoras
 
-Torrents que compartilham os mesmos arquivos (hardlinks de cross-seed) formam um grupo
-fisico. A selecao agora avalia o grupo inteiro em todos os modos:
+Torrents que compartilham ao menos um arquivo (mesmo inode, hardlinks de cross-seed)
+formam um grupo fisico. O grupo e o componente conectado: um link que usa so um subconjunto
+dos arquivos do pai continua no mesmo grupo. O espaco liberavel e a soma dos arquivos cujos
+nomes estao todos dentro do grupo. A selecao avalia o grupo inteiro em todos os modos, inclusive
+no normal (antes, cada torrent era avaliado isolado ali):
 
 - o torrent **pai** (qualquer membro fora de `FOLLOWER_CATEGORIES`) decide: todos os pais
   precisam passar por retencao, ratio, inatividade, rendimento, historico e score;
@@ -391,6 +394,8 @@ sudo systemctl enable --now qbit-autodelete.timer
 systemctl list-timers qbit-autodelete.timer
 journalctl -u qbit-autodelete.service -n 100 --no-pager
 ```
+
+`qbit-del stop`, `start`, `restart` e `status` tratam tambem o timer de pressao quando ele esta instalado.
 
 O modelo da unit define `TimeoutStartSec=20min`: uma varredura travada no disco nao bloqueia
 as proximas rodadas em silencio. A prioridade de I/O e `best-effort` baixa; a classe `idle`

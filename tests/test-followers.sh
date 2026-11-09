@@ -149,6 +149,51 @@ assert_eq "$(select_candidates "${scored}" | jq 'length')" "0" "hardlink externo
 rm -f "${dir}/fora-do-grupo.mkv"
 FOLLOWER_ORPHAN_HOURS=0
 
+# subconjunto de arquivos: o link usa so parte dos arquivos do pai e ainda assim
+# forma um unico grupo (componente conectado por inode compartilhado)
+mkdir -p "${dir}/pai-dir" "${dir}/link-dir"
+head -c 8192 /dev/zero >"${dir}/pai-dir/a.mkv"
+head -c 8192 /dev/zero | tr '\0' 'x' >"${dir}/pai-dir/b.mkv"
+printf 'nfo-do-pai' >"${dir}/pai-dir/release.nfo"
+ln "${dir}/pai-dir/a.mkv" "${dir}/link-dir/a.mkv"
+ln "${dir}/pai-dir/b.mkv" "${dir}/link-dir/b.mkv"
+sub_parent="$(mk pai "Categoria Filmes" "${dir}/pai-dir" 100 0 0 "")"
+sub_link="$(mk lsub cross-seed-link "${dir}/link-dir" 1 0 0 "")"
+sub_input="$(jq -cn --argjson a "${sub_parent}" --argjson b "${sub_link}" '[$a,$b]')"
+scored="$(run_case emergency <<<"${sub_input}")"
+assert_eq "$(jq -r '[.[].physical_group_key] | unique | length' <<<"${scored}")" "1" "subconjunto forma um grupo so"
+assert_eq "$(jq -r '.[0].physical_group_member_count' <<<"${scored}")" "2" "dois torrents no grupo"
+assert_eq "$(jq -r '.[0].physical_group_complete' <<<"${scored}")" "true" "todos os nomes estao no grupo"
+selected="$(select_candidates "${scored}")"
+assert_eq "$(jq 'length' <<<"${selected}")" "2" "pai e link do subconjunto saem juntos na pressao"
+(($(jq '[.[].selection_bytes] | add' <<<"${selected}") >= 3 * 4096)) || fail "deveria liberar os tres arquivos"
+
+# um nome fora do grupo reduz o espaco liberavel mas nao impede o pai de sair
+ln "${dir}/pai-dir/a.mkv" "${dir}/fora-a.mkv"
+scored="$(run_case emergency <<<"${sub_input}")"
+assert_eq "$(jq -r '.[0].physical_group_complete' <<<"${scored}")" "false" "nome externo detectado"
+selected="$(select_candidates "${scored}")"
+assert_eq "$(jq 'length' <<<"${selected}")" "2" "ainda libera os arquivos restantes"
+without_outside="$(jq -r '.[0].physical_group_reclaimable_bytes' <<<"${scored}")"
+rm -f "${dir}/fora-a.mkv"
+scored="$(run_case emergency <<<"${sub_input}")"
+(($(jq -r '.[0].physical_group_reclaimable_bytes' <<<"${scored}") > without_outside)) ||
+  fail "remover o nome externo deveria aumentar o espaco liberavel"
+
+# cadeia A-B-C: tres torrents ligados por arquivos distintos viram um grupo
+printf 'x1' >"${dir}/c1"; ln "${dir}/c1" "${dir}/c2"
+printf 'x2' >"${dir}/c3"; ln "${dir}/c3" "${dir}/c4"
+mkdir -p "${dir}/ta" "${dir}/tb" "${dir}/tc"
+ln "${dir}/c1" "${dir}/ta/f1"; ln "${dir}/c3" "${dir}/ta/f2"
+ln "${dir}/c1" "${dir}/tb/f1"
+ln "${dir}/c3" "${dir}/tc/f2"
+chain="$(jq -cn --argjson a "$(mk ca cross-seed-link "${dir}/ta" 1 0 0 "")" \
+  --argjson b "$(mk cb cross-seed-link "${dir}/tb" 1 0 0 "")" \
+  --argjson c "$(mk cc cross-seed-link "${dir}/tc" 1 0 0 "")" '[$a,$b,$c]')"
+scored="$(run_case normal <<<"${chain}")"
+assert_eq "$(jq -r '[.[].physical_group_key] | unique | length' <<<"${scored}")" "1" "cadeia vira um componente"
+assert_eq "$(jq -r '.[0].physical_group_member_count' <<<"${scored}")" "3" "tres membros"
+
 # choose_mode: rendimento so cede quase sem espaco
 DISK_PRESSURE_ENABLED=true
 STORAGE_PATH="/tmp"

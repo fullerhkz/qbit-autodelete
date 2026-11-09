@@ -707,8 +707,12 @@ estimate_path_reclaimable_bytes() {
   printf '0'
 }
 
+# Agrupa os torrents por componente conectado: dois torrents pertencem ao mesmo grupo
+# quando compartilham ao menos um inode (hardlink de cross-seed), mesmo que um deles
+# use so um subconjunto dos arquivos do outro. O espaco liberavel de um grupo e a soma
+# dos arquivos cujos nomes (links) estao todos dentro dele.
 enrich_reclaimability() {
-  local scored_json="$1" mapping hash encoded_path path stats signature max_links bytes
+  local scored_json="$1" mapping hash encoded_path path
   if [[ "${DELETE_FILES}" != "true" ||
     ( "${DISK_PRESSURE_ENABLED}" != "true" && "${FOLLOWERS_JSON}" == "[]" ) ]]; then
     jq -c 'map(. + {
@@ -716,6 +720,7 @@ enrich_reclaimability() {
       physical_reclaim_estimated:false,
       physical_group_key:null,
       physical_group_member_count:1,
+      physical_group_complete:null,
       physical_group_reclaimable_bytes:null
     })' \
       <<<"${scored_json}"
@@ -725,44 +730,53 @@ enrich_reclaimability() {
   mapping="$(
     while IFS=$'\t' read -r hash encoded_path; do
       path="$(printf '%s' "${encoded_path}" | base64 --decode 2>/dev/null || true)"
-      stats=""
+      local stats=""
       if [[ -f "${path}" ]]; then
         stats="$(stat -c '%d:%i %h %b' -- "${path}" 2>/dev/null || true)"
       elif [[ -d "${path}" ]]; then
         stats="$(find "${path}" -xdev -type f -printf '%D:%i %n %b\n' 2>/dev/null |
           sort -k1,1 -u)"
       fi
-
       if [[ -n "${stats}" ]]; then
-        signature="$(awk '{print $1}' <<<"${stats}" | sha256sum | awk '{print $1}')"
-        read -r max_links bytes < <(awk '
-          {if ($2 > max_links) max_links=$2; blocks += $3}
-          END {printf "%d %.0f\n", max_links, blocks * 512}
-        ' <<<"${stats}")
-        printf '%s\t%s\t%s\t%s\n' "${hash}" "${signature}" "${max_links:-0}" "${bytes:-0}"
+        awk -v hash="${hash}" '{printf "%s\t%s\t%s\t%s\n", hash, $1, $2, $3}' <<<"${stats}"
       else
         printf '%s\t\t0\t0\n' "${hash}"
       fi
     done < <(jq -r '.[] | [(.hash // ""), ((.content_path // "") | @base64)] | @tsv' <<<"${scored_json}") |
       jq -Rn '
         [inputs | split("\t") | {
-          hash:.[0], signature:.[1], max_links:(.[2] | tonumber), bytes:(.[3] | tonumber)
-        }] as $rows
-        | reduce ($rows | map(select(.signature != "")) | group_by(.signature)[]) as $group
-            ({};
-              ($group | length) as $members
-              | ($group | map(.max_links) | max // 0) as $required_links
-              | ($group | map(.bytes) | max // 0) as $group_bytes
-              | reduce $group[] as $item (.;
-                  .[$item.hash] = {
-                    key:$item.signature,
-                    member_count:$members,
-                    reclaimable_bytes:(if $members >= $required_links then $group_bytes else 0 end),
-                    individual_reclaimable_bytes:(if $item.max_links <= 1 then $item.bytes else 0 end)
-                  }))
-        | reduce ($rows[] | select(.signature == "")) as $item (.;
+          hash:.[0], ino:.[1], nlink:(.[2] | tonumber), blocks:(.[3] | tonumber)
+        }] as $lines
+        | ($lines | group_by(.hash)
+           | map({hash: .[0].hash, files: (map(select(.ino != "")) | unique_by(.ino))})) as $rows
+        | ($rows | map(select(.files | length > 0))) as $with
+        # inodes referenciados por 2 ou mais torrents ligam os torrents entre si
+        | ($with | map(.hash as $h | .files[] | {ino, h: $h}) | group_by(.ino)
+           | map(select(length > 1) | map(.h) | unique)) as $links
+        | ($with | map({key: .hash, value: .hash}) | from_entries) as $start
+        | ($start | until(
+            . as $label | ($links | map(map($label[.]) | unique | length) | all(. == 1));
+            reduce $links[] as $set (.;
+              . as $cur | ($set | map($cur[.]) | min) as $low
+              | reduce $set[] as $h (.; .[$h] = $low)))) as $label
+        | reduce ($with | group_by($label[.hash])[]) as $comp ({};
+            ($comp | map(.hash)) as $members
+            | ($comp | map(.files[]) | group_by(.ino)
+               | map({ino: .[0].ino, nlink: .[0].nlink, blocks: .[0].blocks, names: length})) as $inodes
+            | ((($inodes | map(select(.names >= .nlink) | .blocks) | add) // 0) * 512) as $freed
+            | ($inodes | all(.names >= .nlink)) as $complete
+            | ("grp:" + ($members | min)) as $key
+            | reduce $comp[] as $row (.;
+                .[$row.hash] = {
+                  key: $key, member_count: ($members | length),
+                  complete: $complete, reclaimable_bytes: $freed,
+                  individual_reclaimable_bytes:
+                    ((($row.files | map(select(.nlink <= 1) | .blocks) | add) // 0) * 512)
+                }))
+        | reduce ($rows[] | select(.files | length == 0)) as $item (.;
             .[$item.hash] = {
-              key:null, member_count:1, reclaimable_bytes:0, individual_reclaimable_bytes:0
+              key: null, member_count: 1, complete: false,
+              reclaimable_bytes: 0, individual_reclaimable_bytes: 0
             })
       '
   )"
@@ -773,6 +787,7 @@ enrich_reclaimability() {
       physical_reclaim_estimated: true,
       physical_group_key: ($mapping[.hash].key // null),
       physical_group_member_count: ($mapping[.hash].member_count // 1),
+      physical_group_complete: ($mapping[.hash].complete // false),
       physical_group_reclaimable_bytes: ($mapping[.hash].reclaimable_bytes // 0)
     })
   ' <<<"${scored_json}"
@@ -807,7 +822,7 @@ SELECT_JQ='
          # Orfao so quando todos os nomes do arquivo estao no grupo: um hardlink fora
          # dele (rTorrent, categoria nao gerenciada) indica um pai protegido.
          if $orphan_hours > 0 and ($all[0].physical_group_key != null)
-            and (($all[0].physical_reclaim_estimated // false) and (($all[0].physical_group_reclaimable_bytes // 0) > 0))
+            and (($all[0].physical_reclaim_estimated // false) and ($all[0].physical_group_complete // false))
             and all($followers[]; (.age_hours >= $orphan_hours) and ((.follower_veto // false) | not))
          then {kind: "cand", reason: "orfao", members: $all, rank: 100}
          else {kind: "blocked", reason: (if $orphan_hours > 0 then "orfao_aguardando" else "orfao_ignorado" end)} end
