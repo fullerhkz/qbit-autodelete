@@ -585,7 +585,8 @@ score_torrents() {
                 observed_seconds: $observed_seconds
               },
               eligible: (
-                ($blocked_incomplete | not)
+                ($is_follower | not)
+                and ($blocked_incomplete | not)
                 and ($blocked_retention | not)
                 and ($blocked_inactivity | not)
                 and ($blocked_ratio | not)
@@ -803,7 +804,10 @@ SELECT_JQ='
     | ($all | map(select(follower | not))) as $parents
     | ($all | map(select(follower))) as $followers
     | (if ($parents | length) == 0 then
+         # Orfao so quando todos os nomes do arquivo estao no grupo: um hardlink fora
+         # dele (rTorrent, categoria nao gerenciada) indica um pai protegido.
          if $orphan_hours > 0 and ($all[0].physical_group_key != null)
+            and (($all[0].physical_reclaim_estimated // false) and (($all[0].physical_group_reclaimable_bytes // 0) > 0))
             and all($followers[]; (.age_hours >= $orphan_hours) and ((.follower_veto // false) | not))
          then {kind: "cand", reason: "orfao", members: $all, rank: 100}
          else {kind: "blocked", reason: (if $orphan_hours > 0 then "orfao_aguardando" else "orfao_ignorado" end)} end

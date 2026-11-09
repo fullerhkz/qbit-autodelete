@@ -126,8 +126,10 @@ YIELD_OVERRIDE=false
 SKIP_ACTIVE_TRANSFERS=true
 
 # orfaos: so saem se a opcao estiver ligada e o tempo vencido
-orphan_a="$(mk la cross-seed-link "${dir}/link1.mkv" 30 0 0 "")"
-orphan_b="$(mk lb cross-seed-link "${dir}/link2.mkv" 30 0 0 "")"
+printf 'conteudo-orfao' >"${dir}/orfao1.mkv"
+ln "${dir}/orfao1.mkv" "${dir}/orfao2.mkv"
+orphan_a="$(mk la cross-seed-link "${dir}/orfao1.mkv" 30 0 0 "")"
+orphan_b="$(mk lb cross-seed-link "${dir}/orfao2.mkv" 30 0 0 "")"
 only_links="$(jq -cn --argjson a "${orphan_a}" --argjson b "${orphan_b}" '[$a,$b]')"
 scored="$(run_case normal <<<"${only_links}")"
 RUN_MODE=normal
@@ -136,6 +138,15 @@ FOLLOWER_ORPHAN_HOURS=24
 assert_eq "$(select_candidates "${scored}" | jq 'length')" "2" "orfaos vencidos saem quando habilitado"
 FOLLOWER_ORPHAN_HOURS=48
 assert_eq "$(select_candidates "${scored}" | jq 'length')" "0" "orfaos antes do prazo ficam"
+FOLLOWER_ORPHAN_HOURS=0
+
+# orfao cujo arquivo tem outro hardlink fora do grupo (pai protegido) nunca sai
+ln "${dir}/orfao1.mkv" "${dir}/fora-do-grupo.mkv"
+FOLLOWER_ORPHAN_HOURS=24
+scored="$(run_case normal <<<"${only_links}")"
+RUN_MODE=normal
+assert_eq "$(select_candidates "${scored}" | jq 'length')" "0" "hardlink externo protege os orfaos"
+rm -f "${dir}/fora-do-grupo.mkv"
 FOLLOWER_ORPHAN_HOURS=0
 
 # choose_mode: rendimento so cede quase sem espaco
