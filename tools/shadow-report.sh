@@ -44,7 +44,7 @@ current="$(curl -fsS -b "${cookie}" -H "Referer: ${QBT_URL}/" "${QBT_URL}/api/v2
 now_epoch="$(date +%s)"
 jq -rn \
   --slurpfile ev <(printf '%s\n' "${events}") \
-  --argjson current "${current}" \
+  --slurpfile current_file <(printf '%s' "${current}") \
   --argjson now "${now_epoch}" \
   --argjson min_age "${MIN_AGE_HOURS}" \
   --argjson threshold "${THRESHOLD_PERCENT}" '
@@ -55,7 +55,7 @@ jq -rn \
          else ((.[0:1] | if . == "-" then -1 else 1 end)
                * ((.[1:3] | tonumber) * 3600 + (.[4:6] | tonumber) * 60)) end) as $offset
     | $base - $offset;
-  ($current | map({key: .hash, value: .}) | from_entries) as $now_by_hash
+  ($current_file[0] | map({key: .hash, value: .}) | from_entries) as $now_by_hash
   | [$ev[] | select(.event == "dry_run_candidate")]
   | group_by(.hash) | map(sort_by(.timestamp) | .[0]) as $first
   | [$first[]
