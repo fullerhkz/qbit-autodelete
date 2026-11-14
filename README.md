@@ -91,7 +91,7 @@ a retencao normal/de emergencia continua valendo. O padrao e `false`.
 
 Tags protegidas, incompletos, force start, transferencias ativas e limites por rodada
 continuam protegidos conforme a configuracao existente. A excecao nao se aplica a
-categorias fora de `BJ ` nem a followers. O espaco e reconferido antes da exclusao:
+categorias fora de `BJ `. O espaco e reconferido antes da exclusao:
 se ja recuperou, candidatos que dependiam da dispensa de retencao sao retirados.
 Isso nao autoriza limpar outro cliente nem garante espaco se so restarem itens protegidos.
 
@@ -155,22 +155,6 @@ o grupo e removido junto e os blocos fisicos sao contabilizados uma unica vez. S
 dos membros estiver protegido por retencao, ratio, tag ou transferencia ativa, o grupo
 inteiro fica fora daquela rodada para nao prometer espaco que continuaria ocupado.
 
-Uma categoria de links do cross-seed pode ser limitada ao modo de emergencia usando
-uma retencao normal deliberadamente impraticavel e uma retencao de emergencia real:
-
-```text
-cross-seed-link|87600|1.0|24
-```
-
-Assim, a limpeza normal nao encerra cross-seeds. Sob emergencia, o estimador pode
-selecionar o ultimo hardlink isolado ou o conjunto completo de torrents elegiveis que
-compartilha os mesmos blocos. A menor pontuacao do conjunto define sua prioridade,
-preservando conteudo produtivo mesmo quando um cross-seed associado tem score alto.
-O qBittorrent pode deixar
-arquivos extras sem referencia dentro do `linkDir`; o cross-seed nao remove esses
-orfaos. Use uma ferramenta propria, como `qbit_manage --rem-orphaned`, limitada ao
-`linkDir` e validada primeiro com `--dry-run`.
-
 O historico e gravado de forma atomica, e o resumo usado por `qbit-del log` e produzido
 como telemetria auxiliar. Uma falha apenas nesses dados gera aviso, mas nao cancela uma
 exclusao ja planejada. Isso evita que falta de espaco ou um resumo muito grande bloqueiem
@@ -181,30 +165,24 @@ real observada no filesystem antes/depois da API. Como o qBittorrent pode exclui
 arquivos depois de responder, `PHYSICAL_MEASURE_TIMEOUT_SECONDS` controla por quanto
 tempo o script acompanha o `df`. Escritas concorrentes ainda podem afetar a medicao.
 
-## Cross-seed, rendimento e modo de pressao (v3.7)
+## Grupos de arquivos, rendimento e modo de pressao
 
 Esta secao descreve os recursos pensados para maximizar o upload dado o disco.
 
-### Grupos de hardlinks e categorias seguidoras
+### Torrents que compartilham arquivos
 
-Torrents que compartilham ao menos um arquivo (mesmo inode, hardlinks de cross-seed)
-formam um grupo fisico. O grupo e o componente conectado: um link que usa so um subconjunto
-dos arquivos do pai continua no mesmo grupo. O espaco liberavel e a soma dos arquivos cujos
-nomes estao todos dentro do grupo. A selecao avalia o grupo inteiro em todos os modos, inclusive
-no normal (antes, cada torrent era avaliado isolado ali):
+Somente torrents do qBittorrent em categorias listadas no arquivo de regras sao
+gerenciados. Torrents que compartilham arquivos (mesmo caminho ou hardlink) formam um
+grupo fisico, que e avaliado e excluido junto. O grupo e o componente conectado: um
+torrent que usa so parte dos arquivos de outro continua no mesmo grupo. A selecao avalia
+o grupo inteiro em todos os modos: todos os membros precisam passar por retencao, ratio,
+inatividade, rendimento, historico e score.
 
-- o torrent **pai** (qualquer membro fora de `FOLLOWER_CATEGORIES`) decide: todos os pais
-  precisam passar por retencao, ratio, inatividade, rendimento, historico e score;
-- os **seguidores** (`FOLLOWER_CATEGORIES`, por exemplo `cross-seed-link`) nao tem regra
-  propria. Saem junto com o pai, com o conteudo e os hardlinks, na mesma chamada de exclusao;
-- uma tag protegida (`PROTECTED_TAGS`) em qualquer seguidor veta o grupo inteiro;
-- um seguidor que baixou dados (`downloaded > 0`) protege o grupo por
-  `FOLLOWER_DOWNLOAD_PROTECT_HOURS`, pois um download parcial pode abrir HnR no outro tracker;
-- grupos sem pai no qBittorrent so saem se `FOLLOWER_ORPHAN_HOURS` for maior que zero.
-
-Uma categoria listada em `FOLLOWER_CATEGORIES` ignora qualquer linha propria no arquivo de
-categorias. O resumo de cada rodada informa por que os grupos foram bloqueados
-(`pai_retencao`, `pai_ratio`, `link_protegido`, `sem_recuperacao`, ...).
+O espaco liberavel conta apenas os inodes cujos nomes estao todos dentro do grupo. Um
+arquivo que tambem tem um nome fora do grupo (por exemplo, um hardlink de um torrent em
+categoria nao listada) continua no disco e nao entra na estimativa; o torrent de fora do
+grupo nunca e selecionado. O resumo de cada rodada informa por que os grupos foram
+bloqueados (`pai_retencao`, `pai_ratio`, `sem_recuperacao`, ...).
 
 ### Protecao por rendimento
 
@@ -229,19 +207,6 @@ esta acima do nivel baixo, quando outra execucao ocupa o lock ou quando a ultima
 completa foi ha menos de `PRESSURE_GATE_MIN_INTERVAL_SECONDS`. Caso contrario faz uma
 execucao completa. Com a unit `qbit-autodelete-gate.timer` (a cada 5 minutos) a reserva de
 disco pode ser menor, pois a reacao a uma rajada deixa de levar ate 30 minutos.
-
-### Modo sombra e avaliacao
-
-Para validar uma politica sem excluir nada, rode uma segunda instancia com `DRY_RUN=true`,
-`STATE_FILE` e `LOCK_FILE` proprios e outra unit. Cada candidato gera um evento
-`dry_run_candidate` com o contador de upload. Depois de 48 a 72 horas:
-
-```bash
-tools/shadow-report.sh --config /etc/qbit-autodelete-shadow.env --unit qbit-autodelete-shadow.service
-```
-
-O relatorio compara o upload que os candidatos geraram depois de indicados com o upload
-total medido. Saida 0 quando o upload descartavel fica abaixo do limite (1% por padrao).
 
 ## Instalador interativo (recomendado)
 
