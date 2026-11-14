@@ -80,6 +80,21 @@ todo o volume, independentemente deste script.
 
 ## Politica
 
+### Ultimo recurso opcional para BJ
+
+`LAST_RESORT_ENABLED=true` permite dispensar a retencao minima de torrents **BJ completos**
+somente em emergencia e abaixo do mesmo limiar de ultimo recurso do rendimento
+(`CRITICAL_WATERMARK_PERCENT × YIELD_OVERRIDE_PERCENT_OF_CRITICAL / 100` quando
+o limite percentual governa). Exemplo: 18% × 33% = **5,94% livre**.
+Nesse estado, os mais antigos por conclusao sao escolhidos primeiro. Acima do limiar,
+a retencao normal/de emergencia continua valendo. O padrao e `false`.
+
+Tags protegidas, incompletos, force start, transferencias ativas e limites por rodada
+continuam protegidos conforme a configuracao existente. A excecao nao se aplica a
+categorias fora de `BJ ` nem a followers. O espaco e reconferido antes da exclusao:
+se ja recuperou, candidatos que dependiam da dispensa de retencao sao retirados.
+Isso nao autoriza limpar outro cliente nem garante espaco se so restarem itens protegidos.
+
 Um torrent so pode ser candidato depois de passar pelas protecoes:
 
 - pertence a uma categoria configurada;

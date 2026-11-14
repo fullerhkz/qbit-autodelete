@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.7.1"
+VERSION="3.7.2"
 
 declare -A RETENTION_HOURS=()
 declare -A EMERGENCY_RETENTION_HOURS=()
@@ -109,6 +109,7 @@ load_config() {
   FOLLOWER_ORPHAN_HOURS="${FOLLOWER_ORPHAN_HOURS:-0}"
   PROTECT_EFFICIENCY_MIB_PER_GIB_DAY="${PROTECT_EFFICIENCY_MIB_PER_GIB_DAY:-0}"
   YIELD_OVERRIDE_PERCENT_OF_CRITICAL="${YIELD_OVERRIDE_PERCENT_OF_CRITICAL:-50}"
+  LAST_RESORT_ENABLED="${LAST_RESORT_ENABLED:-false}"
   REVERIFY_BEFORE_DELETE="${REVERIFY_BEFORE_DELETE:-true}"
   PRESSURE_GATE_MIN_INTERVAL_SECONDS="${PRESSURE_GATE_MIN_INTERVAL_SECONDS:-300}"
   SKIP_FORCE_STARTED="${SKIP_FORCE_STARTED:-true}"
@@ -262,7 +263,7 @@ validate_config() {
   local bool_name
   for bool_name in DRY_RUN DELETE_FILES ALLOW_INCOMPLETE_DELETE INCLUDE_NO_CATEGORY \
     SKIP_FORCE_STARTED SKIP_ACTIVE_TRANSFERS NORMAL_CLEANUP_ENABLED AGGRESSIVE_WITHOUT_HISTORY \
-    EMERGENCY_WITHOUT_HISTORY REVERIFY_BEFORE_DELETE \
+    EMERGENCY_WITHOUT_HISTORY REVERIFY_BEFORE_DELETE LAST_RESORT_ENABLED \
     DISK_PRESSURE_ENABLED CURL_INSECURE; do
     validate_bool "${bool_name}"
   done
@@ -424,6 +425,15 @@ load_state() {
   printf '%s' "${state}"
 }
 
+last_resort_active() {
+  if [[ "${LAST_RESORT_ENABLED:-false}" == "true" &&
+        "${RUN_MODE:-normal}" == "emergency" && "${YIELD_OVERRIDE}" == "true" ]]; then
+    printf true
+  else
+    printf false
+  fi
+}
+
 score_torrents() {
   local now_epoch="$1" rules_json="$2" state_json="$3"
   jq -c \
@@ -436,6 +446,7 @@ score_torrents() {
     --argjson follower_download_protect_hours "${FOLLOWER_DOWNLOAD_PROTECT_HOURS}" \
     --argjson protect_efficiency "${PROTECT_EFFICIENCY_MIB_PER_GIB_DAY}" \
     --argjson yield_override "${YIELD_OVERRIDE}" \
+    --argjson last_resort "$(last_resort_active)" \
     --argjson allow_incomplete "${ALLOW_INCOMPLETE_DELETE}" \
     --argjson skip_forced "${SKIP_FORCE_STARTED}" \
     --argjson skip_active "${SKIP_ACTIVE_TRANSFERS}" \
@@ -502,6 +513,8 @@ score_torrents() {
           | (if $new_sample or $counter_reset or $previous == null then $now
              else ($previous.sampled_at // $now) end) as $next_sampled_at
           | ((.progress // 0) >= 0.9999 and (.amount_left // 0) == 0) as $complete
+          | ($last_resort and $complete and ($is_follower | not)
+             and ($category | startswith("BJ "))) as $retention_override
           | (if (.completion_on // 0) > 0 then .completion_on
              elif (.added_on // 0) > 0 then .added_on
              else $now end) as $completed_at
@@ -533,7 +546,7 @@ score_torrents() {
           | (((.upspeed // 0) > 0) or ((.dlspeed // 0) > 0) or
              ((.state // "") | test("^(checking|moving|allocating)"))) as $active
           | (($allow_incomplete | not) and ($complete | not)) as $blocked_incomplete
-          | ($age_hours < $effective_retention) as $blocked_retention
+          | (($age_hours < $effective_retention) and ($retention_override | not)) as $blocked_retention
           | ($inactive_hours < $effective_min_inactive) as $blocked_inactivity
           | ($ratio_protected) as $blocked_ratio
           | ($protected_by_tag) as $blocked_tag
@@ -549,6 +562,7 @@ score_torrents() {
               configured_retention_hours: $rule.retention_hours,
               emergency_retention_hours: ($rule.emergency_retention_hours // $rule.retention_hours),
               retention_hours: $effective_retention,
+              last_resort_retention_override: $retention_override,
               min_inactive_hours: $effective_min_inactive,
               min_ratio: $rule.min_ratio,
               ratio_protection_max_hours: $effective_ratio_protection_max_hours,
@@ -883,7 +897,10 @@ SELECT_JQ='
                 count: ($members | length), bytes: $group_bytes, rank: $decision.rank} end
       end
   ] as $groups
-  | ([$groups[] | select(.kind == "cand")] | sort_by(.rank, .bytes) | reverse
+  | ([$groups[] | select(.kind == "cand")]
+     | sort_by((if $last_resort then
+          -(.items | map(.completion_on // .added_on // 0) | max)
+        else .rank end), .bytes) | reverse
      | reduce .[] as $group
          ({items: [], rest: [], bytes: 0};
            if (((.items | map(.count) | add // 0) + $group.count) > $max_count)
@@ -943,6 +960,7 @@ _select_run() {
   jq -c \
     --argjson threshold "${threshold}" \
     --arg mode "${RUN_MODE}" \
+    --argjson last_resort "$(last_resort_active)" \
     --arg want "${want}" \
     --argjson without_history "${without_history}" \
     --argjson max_count "${max_count}" \
@@ -1167,6 +1185,8 @@ reverify_selection() {
     printf '%s' "${selected_json}"
     return 0
   fi
+  # The disk may have recovered while the inventory was collected.
+  if [[ "$(last_resort_active)" == "true" ]]; then choose_mode; fi
   hashes="$(jq -r '.[].hash' <<<"${selected_json}" | paste -sd'|' -)"
   if ! response="$(curl "${CURL_COMMON[@]}" -b "${COOKIE_JAR}" -G \
     --data-urlencode "hashes=${hashes}" "${QBT_URL}/api/v2/torrents/info" 2>/dev/null)" ||
@@ -1179,7 +1199,9 @@ reverify_selection() {
     --argjson current "${response}" \
     --arg protected_tags "${PROTECTED_TAGS}" \
     --argjson skip_forced "${SKIP_FORCE_STARTED}" \
+    --argjson skip_active "${SKIP_ACTIVE_TRANSFERS}" \
     --argjson allow_incomplete "${ALLOW_INCOMPLETE_DELETE}" \
+    --argjson last_resort "$(last_resort_active)" \
     --argjson protect_efficiency "${PROTECT_EFFICIENCY_MIB_PER_GIB_DAY}" \
     --argjson yield_override "${YIELD_OVERRIDE}" '
       def tags_of: ((.tags // "") | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)));
@@ -1189,12 +1211,18 @@ reverify_selection() {
       | (map(select(
           ($now[.hash]) as $cur
           | ($cur == null)
+          or ($cur.category != .category)
           or ($cur.save_path != .save_path)
           or ($cur.content_path != .content_path)
           or (($cur | tags_of) as $tags | any($tags[]; . as $t | $protected | index($t)))
           or ((.is_follower // false | not) and (
                 ($skip_forced and ($cur.force_start // false))
-                or (($allow_incomplete | not) and (($cur.progress // 0) < 0.9999))
+                or ((($allow_incomplete | not) or (.last_resort_retention_override // false))
+                    and (($cur.progress // 0) < 0.9999 or ($cur.amount_left // 0) > 0))
+                or ((.last_resort_retention_override // false) and ($last_resort | not)
+                    and (.age_hours < .retention_hours))
+                or ($skip_active and (($cur.upspeed // 0) > 0 or ($cur.dlspeed // 0) > 0
+                    or (($cur.state // "") | test("^(checking|moving|allocating)"))))
                 or (($protect_efficiency > 0) and ($yield_override | not)
                     and ((.size_bytes // 0) > 0)
                     and ((($cur.upspeed // 0) * 86400 / 1048576 / ((.size_bytes // 1) / 1073741824))
@@ -1376,6 +1404,9 @@ main() {
   state_json="$(load_state)"
   now_epoch="$(date +%s)"
   choose_mode
+  if [[ "$(last_resort_active)" == "true" ]]; then
+    log "AVISO" "ultimo recurso ativo: BJ completos sem retencao minima; mais antigos primeiro; demais protecoes mantidas"
+  fi
   scored_json="$(score_torrents "${now_epoch}" "${rules_json}" "${state_json}" <<<"${raw_json}")"
   scored_json="$(enrich_reclaimability "${scored_json}")"
   selected_json="$(select_candidates "${scored_json}")"
