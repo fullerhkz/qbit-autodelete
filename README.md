@@ -423,3 +423,11 @@ Esta é uma correção no script Bash existente, sem novo serviço, dependência
 alteração dos valores da política. O limite de recuperação por rodada considera
 também o próximo candidato, evitando ultrapassar o teto já configurado.
 Teste de regressão: `bash tests/test-file-inventory.sh`.
+
+### Versão 3.8.0: somente categorias do arquivo de regras
+
+O script gerencia apenas torrents do qBittorrent cujas categorias estão no arquivo de
+regras. Cada grupo de torrents que compartilham arquivos só é candidato quando todos os
+membros são elegíveis; os motivos de bloqueio continuam `pai_<motivo>`. Variáveis de
+versões anteriores que não existem mais neste README podem permanecer no arquivo de
+configuração: são lidas e ignoradas.

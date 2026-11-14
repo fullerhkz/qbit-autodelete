@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.7.2"
+VERSION="3.8.0"
 
 declare -A RETENTION_HOURS=()
 declare -A EMERGENCY_RETENTION_HOURS=()
