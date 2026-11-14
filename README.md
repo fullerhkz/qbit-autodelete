@@ -440,4 +440,6 @@ movidos durante a rodada. Falha da API, caminho inválido ou arquivo completo
 que desapareceu bloqueiam a exclusão daquela rodada.
 
 Esta é uma correção no script Bash existente, sem novo serviço, dependência ou
-alteração de política. Teste de regressão: `bash tests/test-file-inventory.sh`.
+alteração dos valores da política. O limite de recuperação por rodada considera
+também o próximo candidato, evitando ultrapassar o teto já configurado.
+Teste de regressão: `bash tests/test-file-inventory.sh`.

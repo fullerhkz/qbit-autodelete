@@ -888,7 +888,7 @@ SELECT_JQ='
          ({items: [], rest: [], bytes: 0};
            if (((.items | map(.count) | add // 0) + $group.count) > $max_count)
               or ($wanted_bytes > 0 and .bytes >= $wanted_bytes)
-              or ($max_reclaim_bytes > 0 and .bytes >= $max_reclaim_bytes)
+              or ($max_reclaim_bytes > 0 and (.bytes + $group.bytes) > $max_reclaim_bytes)
            then .rest += [$group]
            else .items += [$group] | .bytes += $group.bytes
            end)) as $chosen

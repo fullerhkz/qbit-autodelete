@@ -23,3 +23,11 @@ if (enrich_reclaimability "$input") >/dev/null 2>&1; then echo 'failed API accep
 fetch_torrent_file_manifest(){ printf '[{"name":"absent"}]'; }
 if (enrich_reclaimability "$input") >/dev/null 2>&1; then echo 'missing complete file accepted';exit 1;fi
 printf 'OK: shared folder, real hardlinks, API failure, traversal and missing file validated\n'
+
+# Configured ceiling must include the next candidate, not only earlier groups.
+RUN_MODE=emergency;FOLLOWER_ORPHAN_HOURS=0;EMERGENCY_MIN_SCORE=0;EMERGENCY_MAX_RECLAIM_GB_PER_RUN=800
+EMERGENCY_MAX_DELETE_PER_RUN=60;EMERGENCY_WITHOUT_HISTORY=true;BYTES_NEEDED=$((2000*1073741824))
+items=$(jq -cn '[{hash:"one",eligible:true,history_ready:true,cleanup_score:95,physical_group_key:"one",physical_reclaim_estimated:true,physical_group_reclaimable_bytes:(500*1073741824)}, {hash:"two",eligible:true,history_ready:true,cleanup_score:90,physical_group_key:"two",physical_reclaim_estimated:true,physical_group_reclaimable_bytes:(400*1073741824)}, {hash:"three",eligible:true,history_ready:true,cleanup_score:85,physical_group_key:"three",physical_reclaim_estimated:true,physical_group_reclaimable_bytes:(250*1073741824)}]')
+chosen=$(select_candidates "$items")
+jq -e 'length==2 and ([.[].selection_bytes]|add)==(750*1073741824)' >/dev/null <<< "$chosen"
+printf 'OK: configured 800 GiB ceiling respected without overshoot\n'
