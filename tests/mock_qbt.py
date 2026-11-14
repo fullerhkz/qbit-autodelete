@@ -44,6 +44,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/v2/torrents/files":
+            self.reply(200, json.dumps([{"name":"payload.bin","size":65536,"priority":1}]).encode(), "application/json")
+            return
         if parsed.path != "/api/v2/torrents/info":
             self.reply(404)
             return
@@ -51,6 +54,8 @@ class Handler(BaseHTTPRequestHandler):
         now = int(time.time())
         torrent = {
             "hash": "mockhash",
+            "save_path": str(payload_dir),
+            "content_path": str(payload_dir / "payload.bin"),
             "name": "torrent de integracao",
             "category": "Categoria-Filmes",
             "progress": 1,
@@ -76,6 +81,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.reply(200, json.dumps([torrent]).encode(), "application/json")
 
+
+payload_dir = Path(sys.argv[1] + ".payload").resolve()
+payload_dir.mkdir()
+(payload_dir / "payload.bin").write_bytes(b"x" * 65536)
 
 server = HTTPServer(("127.0.0.1", 0), Handler)
 Path(sys.argv[1]).write_text(str(server.server_port), encoding="utf-8")

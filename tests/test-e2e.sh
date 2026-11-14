@@ -13,6 +13,8 @@ state_file="${TEST_ROOT}/tests/fixtures/e2e-state.json"
 rm -f "${state_file}"
 cleanup_test() {
   kill "${server_pid}" 2>/dev/null || true
+  rm -f "${port_file}.payload/payload.bin"
+  rmdir "${port_file}.payload" 2>/dev/null || true
   rm -f "${state_file}" "${state_file}.lastrun" "${port_file}" "${delete_file}" \
     "${TEST_ROOT}/tests/fixtures/e2e-gate-state.json" "${TEST_ROOT}/tests/fixtures/e2e-gate-state.json.lastrun" \
     "${TEST_ROOT}/tests/fixtures/e2e-gate.lock"

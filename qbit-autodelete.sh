@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Toda a configuracao fica fora do codigo. Use --config para outro servidor.
 CONFIG_FILE="${QBIT_AUTODELETE_CONFIG:-/etc/qbit-autodelete.env}"
-VERSION="3.7.0"
+VERSION="3.7.1"
 
 declare -A RETENTION_HOURS=()
 declare -A EMERGENCY_RETENTION_HOURS=()
@@ -344,7 +344,11 @@ rules_as_json() {
 setup_runtime() {
   umask 077
   exec 9>"${LOCK_FILE}"
-  flock -n 9 || die "outra execucao ainda esta ativa (${LOCK_FILE})"
+  if ! flock -n 9; then
+    log "INFO" "execucao ignorada: outra limpeza ja esta em andamento"
+    emit_event "$(jq -cn --arg run_id "${RUN_ID}" --arg timestamp "$(date --iso-8601=seconds)" '{event:"run_skipped", run_id:$run_id, timestamp:$timestamp, reason:"already_running"}')"
+    exit 0
+  fi
 
   COOKIE_JAR="$(mktemp -t qbit-autodelete-cookie.XXXXXX)"
   trap cleanup EXIT INT TERM
@@ -711,6 +715,36 @@ estimate_path_reclaimable_bytes() {
 # quando compartilham ao menos um inode (hardlink de cross-seed), mesmo que um deles
 # use so um subconjunto dos arquivos do outro. O espaco liberavel de um grupo e a soma
 # dos arquivos cujos nomes (links) estao todos dentro dele.
+# The API owns the file list. content_path may be a folder shared by unrelated torrents.
+fetch_torrent_file_manifest() {
+  curl "${CURL_COMMON[@]}" -b "${COOKIE_JAR}" -G \
+    --data-urlencode "hash=$1" "${QBT_URL}/api/v2/torrents/files"
+}
+
+torrent_file_stats() {
+  local hash="$1" base="$2" complete="$3" manifest encoded priority name path file_stat
+  [[ "${base}" == /* && "${base}" != "/" ]] || return 1
+  manifest="$(fetch_torrent_file_manifest "${hash}")" || return 1
+  jq -e 'type == "array" and length > 0 and all(.[];
+    (.name | type == "string") and (.name | length > 0) and
+    (.name | startswith("/") | not) and (.name | split("/") | all(. != "..")))' \
+    >/dev/null <<<"${manifest}" || return 1
+  while IFS=$'\t' read -r encoded priority; do
+    name="$(printf '%s' "${encoded}" | base64 --decode)"
+    path="${base%/}/${name}"
+    if [[ ! -e "${path}" && -f "${path}.!qB" ]]; then path+=".!qB"; fi
+    if [[ -L "${path}" ]]; then return 1; fi
+    if [[ -f "${path}" ]]; then
+      # Include the actual path: several owners of one path are not extra hardlinks.
+      file_stat="$(stat -c '%d:%i %h %b' -- "${path}")" || return 1
+      printf '%s %s\n' "${file_stat}" \
+        "$(printf '%s' "${path}" | base64 -w0)"
+    elif [[ "${complete}" == "true" && "${priority}" != "0" ]]; then
+      return 1
+    fi
+  done < <(jq -r '.[] | [(.name | @base64), (.priority // 1)] | @tsv' <<<"${manifest}")
+}
+
 enrich_reclaimability() {
   local scored_json="$1" mapping hash encoded_path path
   if [[ "${DELETE_FILES}" != "true" ||
@@ -728,27 +762,23 @@ enrich_reclaimability() {
   fi
 
   mapping="$(
-    while IFS=$'\t' read -r hash encoded_path; do
+    while IFS=$'\t' read -r hash encoded_path complete; do
       path="$(printf '%s' "${encoded_path}" | base64 --decode 2>/dev/null || true)"
       local stats=""
-      if [[ -f "${path}" ]]; then
-        stats="$(stat -c '%d:%i %h %b' -- "${path}" 2>/dev/null || true)"
-      elif [[ -d "${path}" ]]; then
-        stats="$(find "${path}" -xdev -type f -printf '%D:%i %n %b\n' 2>/dev/null |
-          sort -k1,1 -u)"
-      fi
+      stats="$(torrent_file_stats "${hash}" "${path}" "${complete}")" || \
+        die "nao foi possivel validar os arquivos do torrent; exclusao bloqueada"
       if [[ -n "${stats}" ]]; then
-        awk -v hash="${hash}" '{printf "%s\t%s\t%s\t%s\n", hash, $1, $2, $3}' <<<"${stats}"
+        awk -v hash="${hash}" '{printf "%s\t%s\t%s\t%s\t%s\n", hash, $1, $2, $3, $4}' <<<"${stats}"
       else
         printf '%s\t\t0\t0\n' "${hash}"
       fi
-    done < <(jq -r '.[] | [(.hash // ""), ((.content_path // "") | @base64)] | @tsv' <<<"${scored_json}") |
+    done < <(jq -r '.[] | [(.hash // ""), ((.save_path // "") | @base64), (.is_complete // false)] | @tsv' <<<"${scored_json}") |
       jq -Rn '
         [inputs | split("\t") | {
-          hash:.[0], ino:.[1], nlink:(.[2] | tonumber), blocks:(.[3] | tonumber)
+          hash:.[0], ino:.[1], nlink:(.[2] | tonumber), blocks:(.[3] | tonumber), path:.[4]
         }] as $lines
         | ($lines | group_by(.hash)
-           | map({hash: .[0].hash, files: (map(select(.ino != "")) | unique_by(.ino))})) as $rows
+           | map({hash: .[0].hash, files: (map(select(.ino != "")) | unique_by(.path))})) as $rows
         | ($rows | map(select(.files | length > 0))) as $with
         # inodes referenciados por 2 ou mais torrents ligam os torrents entre si
         | ($with | map(.hash as $h | .files[] | {ino, h: $h}) | group_by(.ino)
@@ -762,7 +792,7 @@ enrich_reclaimability() {
         | reduce ($with | group_by($lab[.hash])[]) as $comp ({};
             ($comp | map(.hash)) as $members
             | ($comp | map(.files[]) | group_by(.ino)
-               | map({ino: .[0].ino, nlink: .[0].nlink, blocks: .[0].blocks, names: length})) as $inodes
+               | map({ino: .[0].ino, nlink: .[0].nlink, blocks: .[0].blocks, names: (map(.path) | unique | length)})) as $inodes
             | ((($inodes | map(select(.names >= .nlink) | .blocks) | add) // 0) * 512) as $freed
             | ($inodes | all(.names >= .nlink)) as $complete
             | ("grp:" + ($members | min)) as $key
@@ -779,7 +809,7 @@ enrich_reclaimability() {
               reclaimable_bytes: 0, individual_reclaimable_bytes: 0
             })
       '
-  )"
+  )" || return 1
 
   jq -c --argjson mapping "${mapping}" '
     map(. + {
@@ -1159,6 +1189,8 @@ reverify_selection() {
       | (map(select(
           ($now[.hash]) as $cur
           | ($cur == null)
+          or ($cur.save_path != .save_path)
+          or ($cur.content_path != .content_path)
           or (($cur | tags_of) as $tags | any($tags[]; . as $t | $protected | index($t)))
           or ((.is_follower // false | not) and (
                 ($skip_forced and ($cur.force_start // false))

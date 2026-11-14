@@ -429,3 +429,15 @@ systemctl start qbit-autodelete.service
 
 Dependencias: Bash 4+, `curl`, `jq`, `coreutils`, `awk`, `util-linux` (`flock`) e Linux
 com systemd para o agendamento sugerido.
+
+### Correção 3.7.1: torrents distintos na mesma pasta
+
+O inventário físico consulta `/api/v2/torrents/files` e usa `save_path + name`
+para cada arquivo registrado. Não varre a pasta `content_path` inteira, pois
+vários torrents podem usar a mesma pasta com arquivos diferentes. Caminhos de
+hardlinks são contados uma vez, e a reconferência existente recusa torrents
+movidos durante a rodada. Falha da API, caminho inválido ou arquivo completo
+que desapareceu bloqueiam a exclusão daquela rodada.
+
+Esta é uma correção no script Bash existente, sem novo serviço, dependência ou
+alteração de política. Teste de regressão: `bash tests/test-file-inventory.sh`.
