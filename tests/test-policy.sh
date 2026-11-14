@@ -167,13 +167,21 @@ bundle_input="$(jq -cn \
       eligible:true, history_ready:true
     },
     {
-      hash:"bundle-link", name:"conteudo", category:"cross-seed-link",
+      hash:"bundle-link", name:"conteudo", category:"Categoria Filmes",
       content_path:$link, size_bytes:5, cleanup_score:70,
       eligible:true, history_ready:true
     }
   ]')"
 DISK_PRESSURE_ENABLED=true
 DELETE_FILES=true
+bundle_input="$(jq 'map(.save_path=(.content_path | sub("/[^/]+$";"")))' <<<"${bundle_input}")"
+fetch_torrent_file_manifest() {
+  case "$1" in
+    bundle-original) printf '[{"name":"original"}]';;
+    bundle-link) printf '[{"name":"link"}]';;
+    *) return 1;;
+  esac
+}
 bundle_enriched="$(enrich_reclaimability "${bundle_input}")"
 assert_eq "$(jq -r '.[0].physical_group_member_count' <<<"${bundle_enriched}")" "2" \
   "grupo de hardlinks reconhecido"
