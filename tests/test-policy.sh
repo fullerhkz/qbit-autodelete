@@ -167,7 +167,7 @@ bundle_input="$(jq -cn \
       eligible:true, history_ready:true
     },
     {
-      hash:"bundle-link", name:"conteudo", category:"cross-seed-link",
+      hash:"bundle-link", name:"conteudo", category:"Categoria Filmes",
       content_path:$link, size_bytes:5, cleanup_score:70,
       eligible:true, history_ready:true
     }
